@@ -1,0 +1,18 @@
+{
+  "created_at": "2026-09-18T11:01:40+0800",
+  "source": "hf-mirror.com/unsloth/gemma-4-E4B-it-GGUF",
+  "page": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF",
+  "note": "本文件是下载后的校验清单（原始版本含本机绝对路径，已替换为相对路径）。size 与 sha256 可用来核对你下载的文件。",
+  "files": {
+    "gemma-4-E4B-it-Q4_K_M.gguf": {
+      "path": "model/gemma-4-E4B-it-Q4_K_M.gguf",
+      "size": 4977171584,
+      "sha256": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"
+    },
+    "mmproj-BF16.gguf": {
+      "path": "model/mmproj-BF16.gguf",
+      "size": 991552320,
+      "sha256": "ee01cba03fd9c71ea2ea722225d24a84f72e7197714367e550ef705ef8851bc6"
+    }
+  }
+}

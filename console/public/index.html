@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- 只允许本页自己的资源；不加载任何外部脚本，也就不用 unsafe-eval -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'" />
+<title>Agent 控制台</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <h1>Agent 控制台</h1>
+  <div class="status" id="status-strip">正在读取状态…</div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="overview" class="active">服务状态</button>
+  <button data-tab="models">模型选择</button>
+  <button data-tab="toggles">功能开关</button>
+  <button data-tab="agent">人格与工具</button>
+  <button data-tab="weixin">微信绑定</button>
+  <button data-tab="memory">记忆维护</button>
+  <button data-tab="usage">Token 用量</button>
+  <button data-tab="logs">日志</button>
+</nav>
+
+<main>
+  <!-- 服务状态 -->
+  <section id="tab-overview" class="panel active">
+    <div class="cards" id="service-cards"></div>
+    <div class="row">
+      <button id="btn-restart" class="primary">重启后端服务</button>
+      <button id="btn-stop" class="danger">停止后端服务</button>
+      <span class="hint" id="service-hint"></span>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3>发送队列</h3>
+        <div id="outbox"></div>
+      </div>
+      <div class="card">
+        <h3>长期记忆</h3>
+        <div id="memory"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 模型选择 -->
+  <section id="tab-models" class="panel">
+    <div class="card">
+      <h3>当前默认模型</h3>
+      <div id="current-model" class="big"></div>
+      <div class="row">
+        <select id="provider-select"></select>
+        <select id="model-select"></select>
+        <button id="btn-save-model" class="primary">设为默认</button>
+        <span class="hint" id="model-hint"></span>
+      </div>
+      <p class="hint">模型定义写入 <code>config/modelConfig.json</code>，<strong>重启后端服务后生效</strong>。</p>
+    </div>
+    <div class="card">
+      <h3>故障转移（某个 API 挂了自动换下一个）</h3>
+      <p class="hint">
+        额度用完 / key 失效 / 模型下线时，按下面的顺序自动换到下一个可用模型，
+        并把用户刚发的那条消息<strong>重做一遍</strong>（不重启、不丢上下文）。
+        顺序在 <code>config/modelConfig.json</code> 的 <code>failover.order</code> 里改。
+      </p>
+      <pre class="hint pre-wrap" id="failover-status">读取中…</pre>
+      <div class="row"><button id="btn-failover-refresh">刷新状态</button></div>
+    </div>
+    <div class="card">
+      <h3>添加模型</h3>
+      <div class="form-grid">
+        <label>provider 名<input id="add-provider" placeholder="例如 myrelay（新名字会新建 provider）" /></label>
+        <label>接口地址 baseURL<input id="add-baseurl" placeholder="https://your-endpoint/v1（新建 provider 时必填）" /></label>
+        <label>API Key<input id="add-apikey" type="password" placeholder="sk-…（新建 provider 时建议填）" /></label>
+        <label>模型 id<input id="add-model" placeholder="例如 gpt-5.6" /></label>
+        <label>显示名（可选）<input id="add-name" placeholder="留空就用模型 id" /></label>
+        <label class="checkbox"><input id="add-vision" type="checkbox" /> 支持图片输入（多模态）</label>
+      </div>
+      <div class="row">
+        <button id="btn-add-model" class="primary">添加</button>
+        <span class="hint" id="add-hint">
+          模型定义写入 <code>config/modelConfig.json</code>，<strong>密钥单独写入 <code>config/secrets.json</code></strong>
+          （两者都会自动备份）；<strong>重启后端服务后生效</strong>。
+        </span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>全部可用模型</h3>
+      <div id="model-table"></div>
+    </div>
+  </section>
+
+  <!-- 功能开关 -->
+  <section id="tab-toggles" class="panel">
+    <div class="card">
+      <h3>即时生效</h3>
+      <div id="toggles-immediate"></div>
+    </div>
+    <div class="card">
+      <h3>需要重启生效</h3>
+      <div id="toggles-restart"></div>
+      <div class="row">
+        <button id="btn-restart-2" class="primary">保存并重启</button>
+        <span class="hint" id="toggle-hint"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>上下文长度与压缩</h3>
+      <p class="hint">
+        <b>上下文窗口</b>是模型能装多少 token（写进 modelConfig 的 <code>contextWindow</code>，重启后端生效）；
+        <b>压缩阈值</b>是攒到多少 token 就开始把旧内容摘要化（写进 preset，保存时会顺手重载 preset，新会话生效）。
+      </p>
+      <div class="settings">
+        <div class="toggle">
+          <label class="label">当前默认模型<div class="help" id="ctx-model">—</div></label>
+        </div>
+        <div class="toggle">
+          <label class="label">上下文窗口（tokens）
+            <div class="help">建议 512000（512k）或 1000000（1M）</div>
+          </label>
+          <input class="setting-input" type="number" id="ctx-window" />
+          <button id="btn-ctx-save">保存</button>
+        </div>
+        <div class="toggle">
+          <label class="label">压缩阈值（tokens）
+            <div class="help">攒到这个量就压缩，应明显小于上下文窗口</div>
+          </label>
+          <input class="setting-input" type="number" id="ctx-budget" />
+        </div>
+        <div class="toggle">
+          <label class="label">压缩后保留（tokens）
+            <div class="help">最近多少 token 的原文不动</div>
+          </label>
+          <input class="setting-input" type="number" id="ctx-retain" />
+          <button id="btn-compaction-save">保存并重载 preset</button>
+        </div>
+      </div>
+      <p class="hint" id="compaction-hint"></p>
+    </div>
+  </section>
+
+  <!-- 人格与工具 -->
+  <section id="tab-agent" class="panel">
+    <div class="card">
+      <h3>人格提示词（persona）</h3>
+      <p class="hint" id="persona-path"></p>
+      <textarea id="persona-text" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="btn-save-persona" class="primary">保存人格提示词</button>
+        <button id="btn-reload-persona">重新读取</button>
+        <span class="hint" id="persona-hint">写入前自动备份；重启后端服务后生效。工具说明（loop 提示词）由 harness 生成，不在这里改。</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>挂载的工具</h3>
+      <p class="hint" id="tools-path"></p>
+      <div id="tools-list"></div>
+      <div class="row">
+        <span class="hint" id="tools-hint">启用/禁用后需重启后端服务；改动会备份 preset。往返切换靠这些插件行，删掉整行等于永久移除。</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 微信绑定 -->
+  <section id="tab-weixin" class="panel">
+    <div class="card">
+      <h3>扫码绑定微信</h3>
+      <p class="hint">
+        用手机微信扫描下面的二维码即可把当前微信号接到本系统（重新绑定、或接入另一个微信号都走这里）。
+        扫码成功后 <strong>token 写入 <code>config/secrets.json</code></strong>（自动备份），重启后端服务后生效。
+      </p>
+      <div class="row">
+        <button id="btn-qr-start" class="primary">获取二维码</button>
+        <button id="btn-qr-stop">停止轮询</button>
+        <button id="btn-qr-restart" disabled>重启后端服务（使新凭据生效）</button>
+        <span class="hint" id="qr-status">尚未开始</span>
+      </div>
+      <div id="qr-area" class="qr-area"></div>
+      <p class="hint">
+        提示：二维码一段时间后会失效，界面上会自动刷新（最多几次）。若提示"已绑定过"，
+        说明这个微信号已经连过，现有凭据仍然有效。
+      </p>
+    </div>
+  </section>
+
+  <!-- 记忆维护 -->
+  <section id="tab-memory" class="panel">
+    <div class="card">
+      <h3>记忆与上下文</h3>
+      <p class="hint">
+        三类东西是分开的：<b>时间记忆库</b>是"她长期记得的聊天记录"，
+        <b>对话上下文</b>是"这次聊天记住的内容"，<b>知识图谱</b>是"她认识的人和称呼"。
+        清空后不可恢复，操作会记进日志。
+      </p>
+      <div class="row">
+        <button id="btn-memory-refresh">刷新体量</button>
+        <span class="hint" id="memory-status">尚未读取</span>
+      </div>
+      <div id="memory-cards" class="memory-cards"></div>
+    </div>
+  </section>
+
+  <!-- Token 用量 -->
+  <section id="tab-usage" class="panel">
+    <div class="row">
+      <label>统计范围
+        <select id="usage-days">
+          <option value="1">今天</option>
+          <option value="3">近 3 天</option>
+          <option value="7" selected>近 7 天</option>
+          <option value="30">近 30 天</option>
+        </select>
+      </label>
+      <button id="btn-refresh-usage">刷新</button>
+      <span class="hint">成本按 <code>modelConfig.json</code> 的定价估算；没有定价的模型不计费。</span>
+    </div>
+    <div class="cards" id="usage-cards"></div>
+    <div class="card">
+      <h3>按天</h3>
+      <div id="usage-days-table"></div>
+    </div>
+    <div class="card">
+      <h3>按模型</h3>
+      <div id="usage-model-table"></div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-logs" class="panel">
+    <div class="row">
+      <select id="log-select"></select>
+      <label><input type="checkbox" id="log-follow" checked /> 自动刷新（3 秒）</label>
+      <input id="log-filter" placeholder="过滤关键词（留空显示全部）" />
+      <button id="btn-refresh-log">立即刷新</button>
+      <span class="hint" id="log-hint"></span>
+    </div>
+    <pre id="log-view"></pre>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

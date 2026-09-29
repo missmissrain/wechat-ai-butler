@@ -1,0 +1,321 @@
+{
+  "version": 2,
+  "note": "示例：模型定义（不含任何密钥）。真实使用时复制为 modelConfig.json，密钥填到 secrets.json。",
+  "updatedAt": "2026-09-29T07:10:55.023Z",
+  "defaultModel": {
+    "provider": "volcengine",
+    "model": "doubao-seed-2-0-lite-260215"
+  },
+  "providers": {
+    "volcengine": {
+      "displayName": "火山方舟(豆包)",
+      "api": "openai-responses",
+      "baseURL": "https://ark.cn-beijing.volces.com/api/v3",
+      "baseURLEnv": "ARK_BASE_URL",
+      "apiKeyEnv": "ARK_API_KEY",
+      "docs": "https://www.volcengine.com/docs/82379/1330310",
+      "models": [
+        {
+          "id": "doubao-seed-2-1-pro-260628",
+          "name": "豆包 Seed 2.1 Pro",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "note": "最稳，约 2 倍价",
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "tiers": [
+              {
+                "maxInputTokens": 32000,
+                "input": 0.6,
+                "cacheRead": 0.12,
+                "output": 3.6
+              },
+              {
+                "maxInputTokens": 128000,
+                "input": 0.9,
+                "cacheRead": 0.18,
+                "output": 5.4
+              },
+              {
+                "maxInputTokens": 256000,
+                "input": 1.8,
+                "cacheRead": 0.36,
+                "output": 10.8
+              }
+            ]
+          }
+        },
+        {
+          "id": "doubao-seed-2-0-pro-260215",
+          "name": "豆包 Seed 2.0 Pro",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "tiers": [
+              {
+                "maxInputTokens": 32000,
+                "input": 0.6,
+                "cacheRead": 0.12,
+                "output": 3.6
+              },
+              {
+                "maxInputTokens": 128000,
+                "input": 0.9,
+                "cacheRead": 0.18,
+                "output": 5.4
+              },
+              {
+                "maxInputTokens": 256000,
+                "input": 1.8,
+                "cacheRead": 0.36,
+                "output": 10.8
+              }
+            ]
+          }
+        },
+        {
+          "id": "doubao-seed-2-0-lite-260215",
+          "name": "豆包 Seed 2.0 Lite",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "note": "便宜；原生 function calling 已实测可用",
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "tiers": [
+              {
+                "maxInputTokens": 32000,
+                "input": 0.6,
+                "cacheRead": 0.12,
+                "output": 3.6
+              },
+              {
+                "maxInputTokens": 128000,
+                "input": 0.9,
+                "cacheRead": 0.18,
+                "output": 5.4
+              },
+              {
+                "maxInputTokens": 256000,
+                "input": 1.8,
+                "cacheRead": 0.36,
+                "output": 10.8
+              }
+            ]
+          }
+        },
+        {
+          "id": "doubao-seed-evolving",
+          "name": "豆包 Seed Evolving",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "note": "方舟主推 Agent 模型，未实测（需控制台确认已开通）",
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "tiers": [
+              {
+                "maxInputTokens": 32000,
+                "input": 0.6,
+                "cacheRead": 0.12,
+                "output": 3.6
+              },
+              {
+                "maxInputTokens": 128000,
+                "input": 0.9,
+                "cacheRead": 0.18,
+                "output": 5.4
+              },
+              {
+                "maxInputTokens": 256000,
+                "input": 1.8,
+                "cacheRead": 0.36,
+                "output": 10.8
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "qwen": {
+      "displayName": "通义千问(百炼兼容模式)",
+      "api": "openai-completions",
+      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "baseURLEnv": "DASHSCOPE_BASE_URL",
+      "apiKeyEnv": "DASHSCOPE_API_KEY",
+      "models": [
+        {
+          "id": "qwen3.8-flash",
+          "name": "Qwen3.8 Flash",
+          "input": [
+            "text",
+            "image"
+          ],
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "input": 0.8,
+            "cacheRead": 0.1,
+            "output": 2.7,
+            "source": "百炼官方价（千问AI平台口径）"
+          },
+          "note": "性价比最高，Agent/多模态强"
+        },
+        {
+          "id": "qwen3.8-max",
+          "name": "Qwen3.8 Max",
+          "input": [
+            "text",
+            "image"
+          ],
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "input": 12,
+            "cacheRead": 1.5,
+            "output": 36,
+            "source": "百炼官方价"
+          },
+          "contextWindow": 1000000
+        },
+        {
+          "id": "qwen3.7-max",
+          "name": "Qwen3.7 Max",
+          "input": [
+            "text",
+            "image"
+          ],
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "input": 12,
+            "cacheRead": 2.4,
+            "output": 36,
+            "source": "百炼官方价"
+          }
+        },
+        {
+          "id": "qwen3.6-plus",
+          "name": "Qwen3.6 Plus",
+          "input": [
+            "text",
+            "image"
+          ],
+          "pricing": {
+            "currency": "CNY",
+            "unit": "per_million_tokens",
+            "tiers": [
+              {
+                "maxInputTokens": 256000,
+                "input": 2,
+                "cacheRead": 0.2,
+                "output": 12
+              },
+              {
+                "maxInputTokens": 1000000,
+                "input": 8,
+                "cacheRead": 0.8,
+                "output": 48
+              }
+            ],
+            "source": "百炼官方价（qwen3-6-plus 价格页，华北2·北京）"
+          }
+        }
+      ],
+      "defaultContextWindow": 1000000
+    },
+    "gemma-local": {
+      "displayName": "本地 Gemma4 (llama.cpp)",
+      "api": "openai-responses",
+      "baseURL": "http://127.0.0.1:8080/v1",
+      "baseURLEnv": "GEMMA_LOCAL_BASE_URL",
+      "apiKeyEnv": "LOCAL_LLM_API_KEY",
+      "note": "本机 llama.cpp llama-server；8192 上下文；--reasoning off。启动：Gemma4\\llama.cpp\\build-ninja\\bin\\llama-server.exe",
+      "models": [
+        {
+          "id": "gemma-4-E4B-it-Q4_K_M",
+          "name": "Gemma4 E4B (本地 Q4_K_M)",
+          "input": [
+            "text"
+          ],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "pricing": {
+            "currency": "CNY",
+            "free": true,
+            "source": "本地推理，无 API 成本"
+          }
+        }
+      ],
+      "defaultContextWindow": 32768,
+      "defaultMaxTokens": 4096
+    }
+  },
+  "weixin": {
+    "baseURL": "https://ilinkai.weixin.qq.com",
+    "baseURLEnv": "WEIXIN_ILINK_BASE_URL",
+    "cdnBaseURL": "https://novac2c.cdn.weixin.qq.com/c2c",
+    "cdnBaseURLEnv": "WEIXIN_ILINK_CDN_BASE_URL",
+    "tokenEnv": "WEIXIN_ILINK_BOT_TOKEN",
+    "token": "（把扫码得到的 token 填到 config/secrets.json 的 weixin.token）"
+  },
+  "tts": {
+    "provider": "volcengine",
+    "mode": "websocket-bidirectional",
+    "websocketURL": "wss://openspeech.bytedance.com/api/v3/tts/bidirection",
+    "httpURL": "https://openspeech.bytedance.com/api/v3/tts/create",
+    "httpApiKeyEnv": "VOLCENGINE_TTS_API_KEY",
+    "httpNote": "该 HTTP create 接口对本 Key 返回 403 resource not granted，实际使用 WebSocket 2.0 通道",
+    "appIdEnv": "VOLCENGINE_TTS_APP_KEY",
+    "appId": "7970039943",
+    "accessTokenEnv": "VOLCENGINE_TTS_ACCESS_KEY",
+    "resourceId": "seed-tts-2.0",
+    "model": "seed-audio-1.0",
+    "speaker": "saturn_zh_female_keainvsheng_tob",
+    "format": "wav",
+    "sampleRate": 24000
+  },
+  "failover": {
+    "note": "某个 API 失活（额度/key/模型下线/限流）时按顺序自动换下一个可用模型，并把用户刚发的那条重做一遍。只保留我们自己的 volcengine 与 qwen；老中转（tokens.dahuangf.com）与其 aihub 终端已按用户要求移除。",
+    "enabled": true,
+    "order": [
+      {
+        "provider": "volcengine",
+        "model": "doubao-seed-2-0-lite-260215"
+      },
+      {
+        "provider": "volcengine",
+        "model": "doubao-seed-2-1-pro-260628"
+      },
+      {
+        "provider": "volcengine",
+        "model": "doubao-seed-2-0-pro-260215"
+      },
+      {
+        "provider": "qwen",
+        "model": "qwen3.8-max"
+      },
+      {
+        "provider": "qwen",
+        "model": "qwen3.8-flash"
+      }
+    ],
+    "cooldownMs": 3600000
+  },
+  "secretsFile": "secrets.json"
+}

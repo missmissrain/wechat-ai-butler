@@ -1,0 +1,82 @@
+﻿# 微信 Harness profile 补丁：身份提示词 + 微信 iLink 连接器。
+# 模型 provider、默认模型、密钥与访问地址统一来自 config/modelConfig.json；
+# 启动器 start_stack.py 会注入环境变量（含 baseURL/token）并同步到 settings.yaml。
+
+- id: system-prompt
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: |
+      # 本项目实际使用的中文人格提示词（人设正文）**不随仓库发布**。
+      # 这里放你自己的：写清 她是谁、怎么说话、什么不能做。
+    personaSuffix: |
+      # 开口前自查那一句（同样属于人格，按需填写）。
+# 浏览器 MCP 一次贡献 22 个工具（约 9000 字符）。微信链路默认关掉；
+# 需要时把这两行改回 false（Chromium 已装好，rev 1243）。
+- id: browser-use-playwright-mcp
+  disabled: true
+- id: browser-use
+  disabled: true
+
+# ── 工具结果外置（spill，成本/缓存实验结论）────────────────────────────
+# 策略：**原始结果永远落盘，上下文只放"预览 + 结果路径 + 取回提示"**，
+# 模型需要时用 read 工具按路径读回原文（摘要/预览不是唯一事实来源）。
+#
+# 为什么在这里而不是等压缩：spill 发生在**工具结果刚产生时**，只压"新结果"，
+# 位于上下文末尾；等到压力触发再回头改旧节点会让后继前缀缓存全部失效。
+#
+# 阈值 32KB ≈ 8k token，对应实验里的"规则压缩阈值"：
+#   < 8k token  → 原样保留（不值得动）
+#   ≥ 8k token  → 立即外置 + 预览（不调用任何 LLM 摘要）
+# 宿主 base 默认 50000（≈12.5k token），单条就能吃掉 26k 预算的一半，故收紧。
+- id: spill-policy
+  config:
+    maxInlineBytes: 32768
+
+# ── 重复调用提醒（针对小模型调紧）────────────────────────────────────────
+# 4B 级模型（Gemma4 E4B）看到工具结果后容易原地重试同一动作。
+# 框架默认阈值是 [3,5,8]，这里提前到 [2,3,4]，让它更早被提醒"别重复、快收尾"。
+- id: repeat-tool-reminder
+  config:
+    thresholds: [2, 3, 4]
+    argumentsPreviewChars: 300
+
+# ── 定时提醒（宿主级）──────────────────────────────────────────────────
+# schedule 必须挂在宿主：它的 inject 是 ['agents','sessions','tools','sessionPersistence']，
+# 通过监听 `agent/created` 给每个 agent 安装 schedule_create / schedule_list / schedule_delete。
+# 提醒以**同一会话的 follow-up 消息**投递 → 正好走我们的 agent loop → outbox → 微信，
+# 等价于"定时给我发微信"（没有邮件/短信/推送，且会话不在 live 时只会在恢复后补发）。
+# 能力边界：after_seconds（一次性延迟）/ at（绝对时刻）/ every_seconds（固定间隔，最小 300s）；
+# **没有 cron/日历规则**，"每周五 21:00" 只能用 every_seconds 锚点或一次性自续期近似。
+# time-context 给模型当前本地时间，否则它无法把"周五晚上九点"换算成 at。
+- insert:
+    - id: time-context
+      name: '@deepseek-ai/dsh-time-context'
+
+    - id: schedule
+      name: '@deepseek-ai/dsh-schedule'
+
+- insert:
+    - id: webhook-weixin
+      name: '@deepseek-ai/dsh-webhook-weixin'
+      config:
+        base_url: !!js process.env.WEIXIN_ILINK_BASE_URL
+        token: !!js process.env.WEIXIN_ILINK_BOT_TOKEN
+        cdn_base_url: !!js process.env.WEIXIN_ILINK_CDN_BASE_URL
+        # 旧 JSON 路由状态：仅用于一次性迁移到 SQLite，迁移后只读保留。
+        state_file: !!js process.env.DSH_WEIXIN_STATE_FILE
+        # SQLite 唯一状态源（delivery/outbox/route/cursor/turn_context/lease）。
+        state_db: !!js process.env.DSH_WEIXIN_STATE_DB
+        workspace_path: !!js process.env.DSH_WEIXIN_WORKSPACE
+        provider: !!js process.env.DSH_DEFAULT_PROVIDER
+        model: !!js process.env.DSH_DEFAULT_MODEL
+        agent_preset: weixin-lite
+        send_retry_count: 3
+        send_retry_delay_ms: 1000
+
+# 我们**不在 Web GUI 里**（用户是通过微信跟她说话的），但 harness 的 web 组合默认会往系统
+# 提示词里塞一段方位说明（约 1100 字符）："You are interacting with the user through the
+# DeepSeek Harness Web GUI at http://127.0.0.1:3080 … HMR … pnpm run dev:web …"
+# 对我们的部署是**假的**，还会把模型往“页面/构建”上带。web-app 自己就为此留了开关。
+- id: web-runtime
+  config:
+    surfaceContext: false

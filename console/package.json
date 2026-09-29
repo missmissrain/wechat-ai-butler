@@ -1,0 +1,14 @@
+{
+  "name": "xinai-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agent 控制台：桌面壳（Electron）+ 本地服务（Node 内置模块，零依赖）",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron .",
+    "server": "node server.mjs 3082"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

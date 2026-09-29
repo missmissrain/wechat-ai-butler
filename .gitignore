@@ -1,0 +1,31 @@
+# 保证不进仓库的内容（密钥 / 人格 / 日志 / 真实数据）
+config/secrets.json
+config/secrets.json.bak*
+config/modelConfig.json
+config/modelConfig.json.bak*
+config/weixinProfile.patch.yml
+config/console.env
+
+# 运行产物：日志里有聊天内容与账号指纹
+runtime/
+*.log
+logs/
+
+# 真实数据（通常位于用户目录，这里再挡一层）
+*.db
+*.db-wal
+*.db-shm
+weixin-route-state.json
+timeline/
+graph/
+
+# 历史快照与审计产物（可能残留旧配置）
+备份/
+审计产物/
+
+# Python / Node
+__pycache__/
+*.pyc
+node_modules/
+.vite/
+dist/

@@ -1,0 +1,2898 @@
+diff --git a/apps/cli/package.json b/apps/cli/package.json
+index 9308725..88a67a6 100644
+--- a/apps/cli/package.json
++++ b/apps/cli/package.json
+@@ -94,6 +94,9 @@
+     "@deepseek-ai/dsh-web-app": "workspace:^",
+     "@deepseek-ai/dsh-webhook": "workspace:^",
+     "@deepseek-ai/dsh-webhook-github": "workspace:^",
++    "@deepseek-ai/dsh-webhook-weixin": "workspace:^",
++    "@deepseek-ai/dsh-tool-codex": "workspace:^",
++    "@deepseek-ai/dsh-tool-opencode": "workspace:^",
+     "@deepseek-ai/dsh-workflow-ptc": "workspace:^",
+     "@deepseek-ai/schemastery": "workspace:^",
+     "commander": "^15.0.0",
+diff --git a/packages/bundle/base/cordis.patch.yml b/packages/bundle/base/cordis.patch.yml
+index 97e5cf6..d7f2675 100644
+--- a/packages/bundle/base/cordis.patch.yml
++++ b/packages/bundle/base/cordis.patch.yml
+@@ -471,6 +471,19 @@
+     - id: mcp-resources
+       name: '@deepseek-ai/dsh-mcp-resources'
+ 
++    # 浏览器操作：注册表 + Playwright MCP 提供方（每个活动 Session 独占一个 Chromium）。
++    # 暴露的模型可见工具形如 mcp__playwright-mcp__<tool>：导航、点击、填表、截图、下载等。
++    # mode: launch 由 provider 自己拉起浏览器；headless: true 不弹窗口。
++    # 未安装 Chromium 时用 executablePath 指定，或设 PLAYWRIGHT_MCP_* 环境变量覆盖。
++    - id: browser-use
++      name: '@deepseek-ai/dsh-browser-use'
++
++    - id: browser-use-playwright-mcp
++      name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
++      config:
++        mode: launch
++        headless: true
++
+     # ── rows every mode mounts, whose values each overlay may state ──────────────
+ 
+     # The tool registry. Presentation mode is a deployment choice; omitting it here
+diff --git a/packages/compaction/compaction-basic/src/config.ts b/packages/compaction/compaction-basic/src/config.ts
+index 9628c80..490520a 100644
+--- a/packages/compaction/compaction-basic/src/config.ts
++++ b/packages/compaction/compaction-basic/src/config.ts
+@@ -24,6 +24,7 @@ const DEFAULT_RETAIN_RATIO = 0.16
+ 
+ /** Fields shared by top-level defaults and exact-target overrides. */
+ const POLICY_CONFIG_KEYS = [
++  'compressionBudget',
+   'thresholdRatio',
+   'retainRatio',
+   'retainTokens',
+@@ -85,6 +86,7 @@ export function resolveConfig(config: BasicCompactionConfig = {}): ResolvedConfi
+ 
+   return deepFreeze({
+     thresholdRatio,
++    compressionBudget: config.compressionBudget,
+     ...retention,
+     summarizationProvider: config.summarizationProvider ?? '',
+     summarizationModel: config.summarizationModel ?? '',
+@@ -115,6 +117,7 @@ export function resolveTargetPolicy(
+   return deepFreeze({
+     target: { provider: target.provider, model: target.model },
+     thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
++    compressionBudget: override?.compressionBudget ?? config.compressionBudget,
+     ...resolveRetention(override ?? {}, inheritedRetention),
+     summarizationProvider: override?.summarizationProvider ?? config.summarizationProvider,
+     summarizationModel: override?.summarizationModel ?? config.summarizationModel,
+@@ -141,7 +144,9 @@ export function resolveCompactSpec(
+       `BasicCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`,
+     )
+   }
+-  const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio)
++  // 显式预算优先：有时真正的约束是"价格档位"，而不是模型容量。
++  // 只设 thresholdRatio 时会随 contextWindow 放大（262k × 0.8 = 209k），等于从不治理。
++  const thresholdTokens = policy.compressionBudget ?? Math.floor(contextWindow * policy.thresholdRatio)
+   const retainTokens = policy.retainTokens === undefined
+     ? Math.floor(contextWindow * policy.retainRatio)
+     : policy.retainTokens
+@@ -156,6 +161,7 @@ export function resolveCompactSpec(
+     target: { ...policy.target },
+     contextWindow,
+     thresholdRatio: policy.thresholdRatio,
++    compressionBudget: policy.compressionBudget,
+     thresholdTokens,
+     retainTokens,
+     summarizationProvider: policy.summarizationProvider,
+@@ -228,12 +234,16 @@ function validatePolicy(
+   config: CompactionPolicyConfig | Record<string, unknown>,
+   name: string,
+ ): void {
++  const compressionBudget = config.compressionBudget
+   const thresholdRatio = config.thresholdRatio
+   const retainRatio = config.retainRatio
+   const retainTokens = config.retainTokens
+   const maxTokens = config.maxTokens
+   const compactionRetries = config.compactionRetries
+   const maxOverflowRetries = config.maxOverflowRetries
++  if (compressionBudget !== undefined) {
++    assertPositiveInteger(`${name}.compressionBudget`, compressionBudget)
++  }
+   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio)
+   if (retainRatio !== undefined) assertRatio(`${name}.retainRatio`, retainRatio)
+   if (retainTokens !== undefined) assertNonNegativeInteger(`${name}.retainTokens`, retainTokens)
+diff --git a/packages/compaction/compaction-basic/src/index.ts b/packages/compaction/compaction-basic/src/index.ts
+index 8be02cb..eff31d6 100644
+--- a/packages/compaction/compaction-basic/src/index.ts
++++ b/packages/compaction/compaction-basic/src/index.ts
+@@ -1,4 +1,4 @@
+-/**
++﻿/**
+  * Basic replay-aware compaction backend.
+  *
+  * @module @deepseek-ai/dsh-compaction-basic
+@@ -67,6 +67,7 @@ function conversationTarget(
+   return { provider: agent.options.provider, model: agent.options.model }
+ }
+ 
++const compressionBudgetSchema = z.number().step(1).min(1)
+ const thresholdRatioSchema = z.number()
+ const retainRatioSchema = z.number()
+ const retainTokensSchema = z.number().step(1).min(0)
+@@ -79,6 +80,7 @@ const maxOverflowRetriesSchema = z.number().step(1).min(0)
+ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
+   provider: z.string().required(),
+   model: z.string().required(),
++  compressionBudget: compressionBudgetSchema,
+   thresholdRatio: thresholdRatioSchema,
+   retainRatio: retainRatioSchema,
+   retainTokens: retainTokensSchema,
+@@ -101,7 +103,8 @@ export class BasicCompactionEngine extends CompactionEngine {
+   static inject = ['llm', 'tokenMeter', 'sessions']
+ 
+   static Config: z<BasicCompactionConfig> = z.object({
+-    thresholdRatio: thresholdRatioSchema,
++    compressionBudget: compressionBudgetSchema,
++  thresholdRatio: thresholdRatioSchema,
+     retainRatio: retainRatioSchema,
+     retainTokens: retainTokensSchema,
+     summarizationProvider: summarizationProviderSchema,
+diff --git a/packages/compaction/compaction-basic/src/types.ts b/packages/compaction/compaction-basic/src/types.ts
+index 05fc354..668606e 100644
+--- a/packages/compaction/compaction-basic/src/types.ts
++++ b/packages/compaction/compaction-basic/src/types.ts
+@@ -8,6 +8,16 @@ import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
+ 
+ /** Policy fields shared by the default policy and exact model overrides. */
+ export interface CompactionPolicyConfig {
++  /**
++   * Absolute pressure budget in tokens: compact as soon as the request is expected to exceed it.
++   *
++   * Prefer this over {@link thresholdRatio} when the real concern is the provider's **price
++   * tier** rather than the model's capacity: a 262k-window model that only pays off below 32k
++   * would otherwise wait until `0.8 × 262k = 209k` and never compact. When set, it replaces
++   * the capacity-scaled threshold entirely (the model's own `contextWindow` still governs
++   * overflow detection).
++   */
++  compressionBudget?: number
+   /** Compact at this fraction of the model's context window. Defaults to `0.8`. */
+   thresholdRatio?: number
+   /** Recent context retained as a fraction of the model's window. Defaults to `0.16`. */
+@@ -50,6 +60,8 @@ export type ResolvedRetention =
+ /** Validated policy fields shared before and after exact-target matching. */
+ interface ResolvedPolicyFields {
+   readonly thresholdRatio: number
++  /** Absolute pressure budget, or undefined to scale `thresholdRatio` by the model window. */
++  readonly compressionBudget: number | undefined
+   readonly summarizationProvider: string
+   readonly summarizationModel: string
+   readonly maxTokens: number
+diff --git a/packages/llm/llm-pi-ai/src/adapter.ts b/packages/llm/llm-pi-ai/src/adapter.ts
+index 8dba978..7112bfa 100644
+--- a/packages/llm/llm-pi-ai/src/adapter.ts
++++ b/packages/llm/llm-pi-ai/src/adapter.ts
+@@ -60,6 +60,7 @@ import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attac
+ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
+ import type { ResolvedPiAiProviderProfile } from './config.ts'
+ import { toPiContext } from './context.ts'
++import { probe } from './probe.ts'
+ import { toStreamChunks } from './stream.ts'
+ 
+ /** One resolution's frozen view: the profiles and the collection built from them. */
+@@ -341,10 +342,26 @@ export class PiAiAdapter extends LlmAdapter {
+     // the one it started with and the next call picks up the new one.
+     const profile = this.profileOf(snapshot, options.provider)
+     const model = this.modelOf(snapshot, options.provider, options.model)
++    // [诊断 hook] 仅在 DSH_PI_AI_DEBUG=1 时打印解析后的真实请求端点，便于排查模型路由。
++    if (process.env.DSH_PI_AI_DEBUG === '1') {
++      console.error('[PI-AI-HOOK]', JSON.stringify({ provider: model.provider, id: model.id, api: model.api, baseUrl: model.baseUrl }))
++    }
+     const reasoning = resolveReasoningLevel(
+       model,
+       options.reasoningEffort ?? profile.reasoning,
+     )
++    // [诊断 hook] 记录本次请求的模型与工具清单，判断"工具定义有没有真的发出去"。
++    probe({
++      kind: 'request',
++      provider: options.provider,
++      model: model.id,
++      api: model.api,
++      baseUrl: model.baseUrl,
++      reasoning,
++      toolCount: options.tools?.length ?? 0,
++      tools: (options.tools ?? []).map(tool => tool.name).slice(0, 40),
++      messageRoles: options.messages.map(message => message.role),
++    })
+     const apiKey = await this.config.resolveApiKey(options.provider, profile)
+ 
+     const consumer = new AbortController()
+diff --git a/packages/llm/llm-pi-ai/src/stream.ts b/packages/llm/llm-pi-ai/src/stream.ts
+index 380eec2..bb4de2f 100644
+--- a/packages/llm/llm-pi-ai/src/stream.ts
++++ b/packages/llm/llm-pi-ai/src/stream.ts
+@@ -13,8 +13,37 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, isContextWindowExcee
+ import type { FinishReason, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm'
+ import { isContextOverflow } from '@earendil-works/pi-ai'
+ import type { AssistantMessage, AssistantMessageEvent, Usage as PiUsage } from '@earendil-works/pi-ai'
++import { brief, probe } from './probe.ts'
+ import { toPiReplayState } from './replay.ts'
+ 
++/**
++ * [诊断 hook] 把单个 pi-ai 事件写进探针日志（仅在 DSH_LLM_PROBE_LOG 生效）。
++ * 记录类型与关键载荷，便于回答"模型有没有给 toolcall_* 事件"。
++ */
++function probeEvent(model: string | undefined, event: AssistantMessageEvent): void {
++  const base = { kind: 'event', model, type: event.type }
++  switch (event.type) {
++    case 'text_delta':
++    case 'thinking_delta':
++      probe({ ...base, delta: brief(event.delta, 120) })
++      break
++    case 'toolcall_start':
++    case 'toolcall_delta':
++    case 'toolcall_end':
++      probe({ ...base, contentIndex: event.contentIndex, detail: brief(event, 300) })
++      break
++    case 'done':
++      probe({ ...base, stopReason: event.message.stopReason, usage: event.message.usage })
++      break
++    case 'error':
++      probe({ ...base, reason: event.reason, error: brief(event.error, 300) })
++      break
++    default:
++      probe(base)
++      break
++  }
++}
++
+ /**
+  * Map pi-ai usage (reasoning folded into output by pi-ai).
+  * @param usage - cumulative usage from the terminal pi-ai event.
+@@ -150,6 +179,8 @@ export async function* toStreamChunks(
+   const toolIds = new Map<number, { id: string; name: string }>()
+ 
+   for await (const event of events) {
++    // [诊断 hook] 记录原始 pi-ai 事件，便于判断"模型没给工具调用"还是"链路丢掉了"。
++    probeEvent(requestedModel, event)
+     switch (event.type) {
+       case 'start':
+         break
+diff --git a/packages/llm/llm/src/assembler.ts b/packages/llm/llm/src/assembler.ts
+index 88ae77d..e0c0b9f 100644
+--- a/packages/llm/llm/src/assembler.ts
++++ b/packages/llm/llm/src/assembler.ts
+@@ -8,6 +8,7 @@
+ 
+ import { brandString } from '@deepseek-ai/dsh-brand'
+ import { assertNever } from '@deepseek-ai/dsh-util-values'
++import { canonicalizeBlock } from './zh-wire.ts'
+ import type { ToolCallId } from './brand.ts'
+ import { createMessage } from './message.ts'
+ import type { Message, MessageSource } from './message.ts'
+@@ -106,16 +107,17 @@ export class BlockAssembler {
+   }
+ 
+   private assemble(partial: PartialBlock, index: number): ContentBlock {
+-    if (partial.block) return partial.block
++    // 显式 block-end 提供的完整块也要过一遍回流映射（对规范名幂等），否则中文工具名会漏映射。
++    if (partial.block) return canonicalizeBlock(partial.block)
+     switch (partial.blockType) {
+       case 'text': return { type: 'text', text: partial.text }
+       case 'reasoning': return { type: 'reasoning', text: partial.text }
+-      case 'tool-call': return {
++      case 'tool-call': return canonicalizeBlock({
+         type: 'tool-call',
+         id: partial.toolCallId ?? brandString<ToolCallId>(`call-${index}`),
+         name: partial.toolCallName ?? '',
+         arguments: partial.toolCallArguments,
+-      }
++      })
+       default: throw new Error(`cannot assemble incomplete block of type "${partial.blockType}"`)
+     }
+   }
+diff --git a/packages/llm/llm/src/index.ts b/packages/llm/llm/src/index.ts
+index bc5b5d6..bee8883 100644
+--- a/packages/llm/llm/src/index.ts
++++ b/packages/llm/llm/src/index.ts
+@@ -6,6 +6,7 @@
+  * @module @deepseek-ai/dsh-llm
+  */
+ 
++import { writeFileSync } from 'node:fs'
+ import { Context } from '@deepseek-ai/cordis'
+ import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+ import { deepFreeze } from '@deepseek-ai/dsh-util-values'
+@@ -36,6 +37,7 @@ import { normalizeApiKey } from './api-key.ts'
+ import {
+   contentHasFile, contentHasImage, fileHandleText, projectFilesToText, projectImagesForTextModel,
+ } from './content.ts'
++import { localizeProse, wireMessages, wireTools, zhWireEnabled } from './zh-wire.ts'
+ import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
+ 
+ export * from './attribution.ts'
+@@ -1058,7 +1060,56 @@ export class LlmRuntime extends TypertRemoteService {
+         : Object.isFrozen(resolvedOptions)
+           ? deepFreeze({ ...resolvedOptions, messages: projectedMessages as Message[] })
+           : { ...resolvedOptions, messages: projectedMessages as Message[] }
+-      const stream = dispatch(this.forAdapter(projectedOptions, adapter))
++      // 中文短协议：出站前把工具名/顶层参数键换成短中文，并把历史里的工具调用名一并替换。
++      const wiredTools = wireTools(projectedOptions.tools)
++      if (process.env.DSH_CONTEXT_DUMP) {
++        const summarize = (options: GenerateOptions) => options.messages.map((message) => {
++          const source = message.source as unknown as Record<string, unknown>
++          return {
++            role: message.role,
++            src: `${String(source.kind)}/${String(source.plugin ?? source.form ?? '')}`,
++            blocks: message.content.map((block) => {
++              if (block.type === 'text') return { type: 'text', chars: block.text.length, head: block.text.slice(0, 120) }
++              if (block.type === 'tool-call') return { type: 'tool-call', name: block.name, chars: block.arguments.length, head: block.arguments.slice(0, 120) }
++              if (block.type === 'tool-result') {
++                const body = JSON.stringify(block.content)
++                return { type: 'tool-result', isError: block.isError === true, chars: body.length, head: body.slice(0, 120) }
++              }
++              return { type: block.type }
++            }),
++          }
++        })
++        const purpose = (projectedOptions as unknown as { purpose?: unknown }).purpose
++        // 只记录主代理请求，避免被后续辅助请求（如标题生成）覆盖。
++        if (purpose === undefined) {
++          writeFileSync(process.env.DSH_CONTEXT_DUMP, JSON.stringify({ purpose, tools: wiredTools, messages: summarize(projectedOptions) }, null, 2), 'utf8')
++        }
++      }
++      if (process.env.DSH_WIRE_ZH_MEASURE === '1') {
++        const textLen = (options: GenerateOptions): number => options.messages
++          .flatMap(message => message.content)
++          .filter(block => block.type === 'text')
++          .reduce((total, block) => total + (block as { text: string }).text.length, 0)
++        const sysLen = (value: unknown): number => typeof value === 'string' ? value.length : 0
++        const before = JSON.stringify(projectedOptions.tools ?? []).length + textLen(projectedOptions) + sysLen((projectedOptions as unknown as { system?: unknown }).system)
++        const afterTools = JSON.stringify(wiredTools ?? []).length
++        const wiredMsgs = wireMessages(projectedOptions.messages)
++        const afterText = wiredMsgs.flatMap(m => m.content).filter(b => b.type === 'text').reduce((t, b) => t + (b as { text: string }).text.length, 0)
++        const after = afterTools + afterText + sysLen(typeof (projectedOptions as unknown as { system?: unknown }).system === 'string' ? localizeProse((projectedOptions as unknown as { system: string }).system) : undefined)
++        const percent = before === 0 ? 0 : ((before - after) / before) * 100
++        console.error(`[zh-wire] total_chars before=${before} after=${after} saved=${before - after} (${percent.toFixed(1)}%) | tools=${JSON.stringify(projectedOptions.tools ?? []).length}->${afterTools}`)
++      }
++
++      const systemText = (projectedOptions as unknown as { system?: unknown }).system
++      const wireOptions = zhWireEnabled()
++        ? {
++            ...projectedOptions,
++            messages: wireMessages(projectedOptions.messages) as Message[],
++            ...wiredTools === undefined ? {} : { tools: wiredTools },
++            ...typeof systemText === 'string' ? { system: localizeProse(systemText) } : {},
++          }
++        : projectedOptions
++      const stream = dispatch(this.forAdapter(wireOptions, adapter))
+       iterator = stream[Symbol.asyncIterator]()
+     } catch (error: unknown) {
+       yield adapterFailureChunk(error, options.signal)
+diff --git a/packages/webhook/webhook-weixin/src/api/ilinkClient.ts b/packages/webhook/webhook-weixin/src/api/ilinkClient.ts
+index dfcc28b..e5cf651 100644
+--- a/packages/webhook/webhook-weixin/src/api/ilinkClient.ts
++++ b/packages/webhook/webhook-weixin/src/api/ilinkClient.ts
+@@ -1,7 +1,57 @@
+ /** 微信 iLink HTTP 客户端：封装长轮询、发消息、上传地址、启动停止通知和 CDN 媒体下载。 */
+ 
+ import { createHash, randomBytes, createCipheriv } from 'node:crypto'
++import { join } from 'node:path'
++import { probe } from '../diagnostics/probe.ts'
+ import { decrypt_aes_ecb, parse_aes_key } from '../media/mediaCrypto.ts'
++
++/**
++ * iLink 客户端身份头。
++ *
++ * 官方插件（@tencent-weixin/openclaw-weixin）在每个请求上都会带：
++ *   iLink-App-Id: <package.json 的 ilink_appid>   → "bot"
++ *   iLink-App-ClientVersion: uint32 = (major<<16)|(minor<<8)|patch
++ * 缺少这两个头发送会被服务端判为 `prepare failed`（ret=-2），
++ * 而接收（getUpdates/notifystart）却是正常的，极易误判成 token 失效。
++ */
++const ILINK_APP_ID = process.env.WEIXIN_ILINK_APP_ID?.trim() || 'bot'
++const ILINK_APP_CLIENT_VERSION = process.env.WEIXIN_ILINK_APP_VERSION?.trim() || '132105'
++
++/** 失效标记文件路径。 */
++function token_marker_path(): string {
++  return process.env.DSH_WEIXIN_TOKEN_MARKER
++    ?? join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh'), 'weixin-token-invalid.flag')
++}
++
++/**
++ * 记录"凭据失效"信号，供启动器/运维发现。
++ *
++ * 发送返回 ret=-2（prepare failed）实测等价于 bot token 失效：此时接收和 notifystart 都还正常，
++ * 只有发送被拒，非常难排查。写一个标记文件让上游能主动提示扫码。
++ */
++function mark_token_invalid(reason: string): void {
++  const path = token_marker_path()
++  void import('node:fs/promises')
++    .then(async fs => {
++      // 去重：60 秒内只写一条，避免一次重试风暴刷出几十行（曾因此让启动器误判与日志爆炸）。
++      const stat = await fs.stat(path).catch(() => undefined)
++      if (stat !== undefined && Date.now() - stat.mtimeMs < 60_000) return
++      await fs.appendFile(path, `${new Date().toISOString()} ${reason}\n`, 'utf8')
++    })
++    .catch(() => undefined)
++}
++
++/**
++ * 发送成功后清除失效标记。
++ *
++ * 标记只在"确实发不出去"时有意义；一旦恢复发送就必须清掉，
++ * 否则启动器会一直按"凭据失效"处理（反复弹登录器），造成假故障。
++ */
++function clear_token_invalid(): void {
++  void import('node:fs/promises')
++    .then(fs => fs.unlink(token_marker_path()))
++    .catch(() => undefined)
++}
+ import type {
+   IlinkBaseInfo, IlinkClientOptions, IlinkGetUpdatesResponse, IlinkMessage, IlinkMessageItem, IlinkSendMessageInput,
+   IlinkUploadRequest, IlinkUploadResponse,
+@@ -38,24 +88,60 @@ export class IlinkClient {
+ 
+   /** 向一个微信用户发送单条文本消息。 */
+   async send_message(input: IlinkSendMessageInput, signal?: AbortSignal): Promise<void> {
+-    const response = await this.post_json<{ ret?: number; errmsg?: string }>('ilink/bot/sendmessage', {
++    // 可选字段必须在“有值”时才出现：JSON.stringify 会把 undefined 变成 null，
++    // 而 iLink 对多出来的空字段（context_token/run_id）会直接回 "prepare failed"。
++    const response = await this.post_json<{ ret?: number; errmsg?: string; errcode?: number }>('ilink/bot/sendmessage', {
+       msg: {
+         from_user_id: '',
+         to_user_id: input.to_user_id,
+         client_id: input.client_id ?? `dsh-${Date.now()}`,
+-        context_token: input.context_token,
++        ...input.context_token === undefined ? {} : { context_token: input.context_token },
+         message_type: 2,
+         message_state: 2,
+         item_list: input.item_list ?? (input.text ? [{ type: 1, text_item: { text: input.text } }] : []),
+-        run_id: input.run_id,
++        ...input.run_id === undefined ? {} : { run_id: input.run_id },
+       },
+       base_info: this.base_info(),
+     }, this.options.timeout_ms, signal)
+     if (response.ret !== undefined && response.ret !== 0) {
+-      const error = new Error(`iLink sendMessage failed: ${response.errmsg ?? response.ret}`) as Error & { retryable?: boolean }
+-      error.retryable = response.ret >= 500 || response.ret === 429
++      // ret=-2（prepare failed）实测是**发送限流**，不是凭据失效：
++      // 连续快速发送时前几条成功、之后全是 ret=-2。凭据本身仍可鉴权（notifystart 正常）。
++      // 旧实现把它当"token 失效"并写标记 → 触发重新扫码 → 新 bot 作废旧 token →
++      // 用户被迫解绑重绑，形成"token 老是过期"的假象。
++      // 真正的凭据失效信号是 errcode -14（session timeout）。
++      const rate_limited = response.ret === -2
++      // 真正发给服务端的 item 数：text 会被折成一个文本 item，
++      // 之前统计 input.item_list（调用方通常不传）永远是 0，排查时严重误导。
++      const effective_items = (input.item_list ?? (input.text ? [1] : [])).length
++      if (response.errcode === -14) mark_token_invalid(response.errmsg ?? 'session timeout')
++      // 把 token 前后各 8 字符打出来：便于和"收到的消息 token"比对，确认是不是旧 token。
++      const shown = input.context_token === undefined
++        ? 'none'
++        : `${input.context_token.slice(0, 12)}…${input.context_token.slice(-8)}`
++      // 请求指纹：用于区分"限流/形态问题"与"凭据问题"，避免把发送故障升级成登录故障。
++      if (rate_limited) {
++        probe('outbound', 'send.rejected', {
++          ret: response.ret,
++          errmsg: response.errmsg,
++          app_id: ILINK_APP_ID,
++          app_client_version: ILINK_APP_CLIENT_VERSION,
++          has_context_token: input.context_token !== undefined,
++          context_token_hash: input.context_token === undefined
++            ? undefined
++            : createHash('sha256').update(input.context_token).digest('hex').slice(0, 12),
++          token_hash: createHash('sha256').update(this.options.token).digest('hex').slice(0, 12),
++          items: effective_items,
++          text_len: (input.text ?? '').length,
++        })
++      }
++      const error = new Error(`iLink sendMessage failed: ${response.errmsg ?? response.ret} (ret=${response.ret}, errcode=${response.errcode ?? '-'}, items=${effective_items}, len=${(input.text ?? '').length}, token=${shown})`) as Error & { retryable?: boolean, rate_limited?: boolean }
++      // 限流可重试（退避后即可恢复）；5xx/429 同样可重试。
++      error.retryable = rate_limited || response.ret >= 500 || response.ret === 429
++      error.rate_limited = rate_limited
+       throw error
+     }
++    // 发送成功即说明凭据可用：清掉可能残留的失效标记。
++    clear_token_invalid()
+   }
+ 
+   /** 以稳定 client_id 有限重试发送，避免瞬时网络错误导致回复丢失。 */
+@@ -67,7 +153,11 @@ export class IlinkClient {
+         await this.send_message({ ...input, client_id }, signal)
+         return
+       } catch (error: unknown) {
+-        const retryable = !(error && typeof error === 'object' && 'retryable' in error && (error as { retryable?: boolean }).retryable === false)
++        // 限流不做客户端内重试：连发 3 次（250/500ms）本身就是触发限流的突发形态，
++        // 而且退避应由 OutboundCoordinator 整链路统一做（它会把冷却扩散到全局）。
++        const rate_limited = (error as { rate_limited?: boolean } | undefined)?.rate_limited === true
++        const retryable = !rate_limited
++          && !(error && typeof error === 'object' && 'retryable' in error && (error as { retryable?: boolean }).retryable === false)
+         if (!retryable || signal?.aborted || (error instanceof Error && error.name === 'AbortError') || attempt === attempts - 1) throw error
+         const delay = Math.max(0, this.options.send_retry_delay_ms ?? 250) * 2 ** attempt
+         await new Promise<void>((resolve, reject) => {
+@@ -176,6 +266,9 @@ export class IlinkClient {
+           Authorization: `Bearer ${this.options.token}`,
+           AuthorizationType: 'ilink_bot_token',
+           'X-WECHAT-UIN': this.wechat_uin,
++          // 官方客户端身份头：缺失会导致 sendMessage 被判 prepare failed。
++          'iLink-App-Id': ILINK_APP_ID,
++          'iLink-App-ClientVersion': ILINK_APP_CLIENT_VERSION,
+         },
+         body: JSON.stringify(body),
+         signal: controller.signal,
+diff --git a/packages/webhook/webhook-weixin/src/index.ts b/packages/webhook/webhook-weixin/src/index.ts
+index 8d74644..0e7c803 100644
+--- a/packages/webhook/webhook-weixin/src/index.ts
++++ b/packages/webhook/webhook-weixin/src/index.ts
+@@ -1,14 +1,30 @@
+-/** Harness 微信插件入口：导出 iLink 协议、消息、Session Adapter、监控器和回复组件。 */
++/**
++ * Harness 微信插件入口：iLink 协议、入站/出站协调器、状态存储与生命周期。
++ *
++ * 重构后的分层（设计文档 §3.1）：
++ *   transport/    只拉取与规范化
++ *   coordination/ 入站幂等路由 + 出站 durable outbox
++ *   state/        SQLite 唯一状态源（delivery/outbox/route/cursor/turn_context/lease）
++ *   lifecycle/    原子 lease 与 OpenClaw 隔离
++ *   reply/        仅文本聚合（无发送语义）
++ *   session/      Agent 单一所有权宿主
++ */
+ 
+ export * from './api/ilinkTypes.ts'
+ export * from './api/ilinkClient.ts'
+ export * from './media/mediaCrypto.ts'
+ export * from './media/mediaTranscoder.ts'
+ export * from './message/messageNormalizer.ts'
+-export * from './monitor/updateMonitor.ts'
+-export * from './reply/replyBuffer.ts'
+-export * from './session/sessionRouteStore.ts'
+-export * from './session/weixinSessionAdapter.ts'
+-export * from './session/harnessAgentHost.ts'
++export * from './diagnostics/probe.ts'
++export * from './types/domain.ts'
++export * from './state/weixinStateStore.ts'
++export * from './state/turnContextStore.ts'
++export * from './state/migrateLegacyRouteState.ts'
++export * from './transport/weixinIngress.ts'
++export * from './coordination/inboundCoordinator.ts'
++export * from './coordination/outboundCoordinator.ts'
++export * from './lifecycle/consumerLease.ts'
++export * from './reply/replyAggregator.ts'
++export * from './session/weixinSessionHost.ts'
+ export * from './runtime/weixinConnector.ts'
+ export * from './plugin.ts'
+diff --git a/packages/webhook/webhook-weixin/src/message/messageNormalizer.ts b/packages/webhook/webhook-weixin/src/message/messageNormalizer.ts
+index 054bca6..ec5f48e 100644
+--- a/packages/webhook/webhook-weixin/src/message/messageNormalizer.ts
++++ b/packages/webhook/webhook-weixin/src/message/messageNormalizer.ts
+@@ -24,6 +24,9 @@ export interface NormalizedWeixinMessage {
+ 
+ export type MediaLoader = (media: IlinkMedia) => Promise<Uint8Array>
+ 
++/** 单个入站媒体的下载上限（字节）。超过就直接跳过，避免大文件把内存和链路拖死。 */
++const MAX_MEDIA_BYTES = Number(process.env.DSH_WEIXIN_MAX_MEDIA_BYTES ?? String(20 * 1024 * 1024))
++
+ /** 将 iLink 消息转换为稳定的 Harness 入站结构；不执行网络和模型调用。 */
+ export class MessageNormalizer {
+   /** 规范化消息并生成稳定 delivery id。 */
+@@ -49,7 +52,19 @@ export class MessageNormalizer {
+   async hydrate_media(message: NormalizedWeixinMessage, loader: MediaLoader): Promise<NormalizedWeixinMessage> {
+     for (const media of message.media) {
+       if (media.data || !media.media || (media.kind === 'voice' && media.source_text !== 'voice_media_requires_asr')) continue
++      // 声明大小超限的直接不下载，改成一条说明性文本。
++      const declared = (media.media as { rawsize?: number; filesize?: number }).rawsize
++        ?? (media.media as { filesize?: number }).filesize
++      if (typeof declared === 'number' && declared > MAX_MEDIA_BYTES) {
++        media.source_text = `媒体过大已跳过（${Math.round(declared / 1024 / 1024)}MB > 上限 ${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)}MB）`
++        continue
++      }
+       media.data = await loader(media.media)
++      if (media.data.length > MAX_MEDIA_BYTES) {
++        delete media.data
++        media.source_text = `媒体过大已跳过（>${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)}MB）`
++        continue
++      }
+       if (media.kind === 'voice') {
+         media.raw_data = media.data
+         const { transcode_silk_to_wav } = await import('../media/mediaTranscoder.ts')
+diff --git a/packages/webhook/webhook-weixin/src/monitor/updateMonitor.ts b/packages/webhook/webhook-weixin/src/monitor/updateMonitor.ts
+deleted file mode 100644
+index 15dd066..0000000
+--- a/packages/webhook/webhook-weixin/src/monitor/updateMonitor.ts
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/** 微信 getUpdates 监控器：处理游标、重复消息、取消和协议错误，不创建 OpenClaw 会话。 */
+-
+-import type { IlinkClient } from '../api/ilinkClient.ts'
+-import type { IlinkGetUpdatesResponse } from '../api/ilinkTypes.ts'
+-import { MessageNormalizer } from '../message/messageNormalizer.ts'
+-import { SessionRouteStore } from '../session/sessionRouteStore.ts'
+-import { WeixinSessionAdapter } from '../session/weixinSessionAdapter.ts'
+-
+-/** 可观察的微信监控阶段，用于耗时和拥塞报告。 */
+-export interface MonitorObserver {
+-  on_phase?(name: string, started_at: number, ended_at: number): void
+-  on_error?(error: unknown): void
+-}
+-
+-/** 可取消的 iLink 长轮询循环。 */
+-export class UpdateMonitor {
+-  private readonly normalizer = new MessageNormalizer()
+-
+-  /** 创建监控器并绑定协议客户端、路由存储和 Session Adapter。 */
+-  constructor(
+-    private readonly client: IlinkClient,
+-    private readonly routes: SessionRouteStore,
+-    private readonly adapter: WeixinSessionAdapter,
+-    private readonly observer: MonitorObserver = {},
+-  ) {}
+-
+-  /** 循环消费消息直到 signal 取消；游标在消息处理批次后提交。 */
+-  async run(signal: AbortSignal): Promise<void> {
+-    await this.routes.load_state()
+-    await this.client.notify_start(signal)
+-    try {
+-      while (!signal.aborted) {
+-        const started = Date.now()
+-        const response = await this.client.get_updates(this.routes.get_cursor(), signal)
+-        this.observer.on_phase?.('get_updates', started, Date.now())
+-        await this.process_response(response)
+-      }
+-    } catch (error: unknown) {
+-      if (!signal.aborted) { this.observer.on_error?.(error); throw error }
+-    } finally {
+-      await this.client.notify_stop().catch(error => this.observer.on_error?.(error))
+-    }
+-  }
+-
+-  /** 处理一个响应批次，先处理消息再提交服务器游标。 */
+-  private async process_response(response: IlinkGetUpdatesResponse): Promise<void> {
+-    if ((response.ret ?? 0) !== 0 || (response.errcode ?? 0) !== 0) throw new Error(`iLink getUpdates failed: ${response.errmsg ?? response.ret ?? response.errcode}`)
+-    for (const message of response.msgs ?? []) {
+-      const normalized = this.normalizer.normalize_message(message)
+-      await this.normalizer.hydrate_media(normalized, media => this.client.download_media(media))
+-      await this.adapter.handle_message(normalized)
+-    }
+-    if (response.get_updates_buf !== undefined) await this.routes.set_cursor(response.get_updates_buf)
+-  }
+-}
+diff --git a/packages/webhook/webhook-weixin/src/plugin.ts b/packages/webhook/webhook-weixin/src/plugin.ts
+index da0d67d..b738d26 100644
+--- a/packages/webhook/webhook-weixin/src/plugin.ts
++++ b/packages/webhook/webhook-weixin/src/plugin.ts
+@@ -1,26 +1,38 @@
+-/** 微信 iLink Cordis 插件：校验配置并以 effect 管理连接器启动、停止和 Agent 清理。 */
++/** 微信 iLink Cordis 插件：校验配置并把连接器生命周期交给 effect。 */
+ 
+ import type { Context } from '@deepseek-ai/cordis'
+ import z from '@deepseek-ai/schemastery'
++import { probe } from './diagnostics/probe.ts'
+ import { install_weixin_connector } from './runtime/weixinConnector.ts'
+ 
+ /** Cordis function-plugin 名称。 */
+ export const name = 'webhook-weixin'
+-/** 连接器所需的 Harness 原生服务。 */
+-export const inject = ['agents']
++/**
++ * 连接器所需的 Harness 原生服务。
++ * 重构设计要求（§8.2）：依赖必须在装配期声明，缺失时**启动即失败**，
++ * 而不是等第一条消息到达才暴露。
++ */
++export const inject = ['agents', 'agentPresets', 'sessionPersistence']
+ 
+-/** 微信连接器配置；token 应由部署层注入，不提交到仓库。 */
++/** 微信连接器配置；token 由部署层注入，不提交到仓库。 */
+ export interface Config {
+   base_url: string
+   token: string
+   cdn_base_url?: string
+-  state_file: string
++  /** 旧版状态文件路径；仅用于一次性迁移到 SQLite，迁移后只读保留。 */
++  state_file?: string
+   workspace_path: string
+   provider: string
+   model: string
+   reasoning_effort?: string
++  /** Agent 预设 id：决定该微信 Agent 能挂到哪些工具。 */
++  agent_preset?: string
+   send_retry_count?: number
+   send_retry_delay_ms?: number
++  /** SQLite 状态库路径；缺省为 $DSH_HOME/weixin-state.db。 */
++  state_db?: string
++  /** lease 标记文件（诊断）。 */
++  lease_marker?: string
+ }
+ 
+ /** Schemastery 配置定义，保持模型/API 配置与代码分离。 */
+@@ -28,18 +40,28 @@ export const Config: z<Config> = z.object({
+   base_url: z.string().required(),
+   token: z.string().role('secret').required(),
+   cdn_base_url: z.string(),
+-  state_file: z.string().required(),
++  state_file: z.string(),
+   workspace_path: z.string().required(),
+   provider: z.string().required(),
+   model: z.string().required(),
+   reasoning_effort: z.string(),
++  agent_preset: z.string(),
+   send_retry_count: z.number(),
+   send_retry_delay_ms: z.number(),
++  state_db: z.string(),
++  lease_marker: z.string(),
+ })
+ 
+-/** 注册微信连接器，并把长轮询和 Agent 生命周期交给 Cordis effect。 */
++/** 注册微信连接器，并把长轮询与生命周期交给 Cordis effect。 */
+ export function apply(ctx: Context, config: Config): void {
+   if (!config.base_url.startsWith('http')) throw new Error('webhook-weixin base_url must be an HTTP URL')
+   if (!config.token.trim()) throw new Error('webhook-weixin token must be non-empty')
++  probe('lifecycle', 'plugin.apply', {
++    base_url: config.base_url,
++    preset: config.agent_preset ?? '(default)',
++    provider: config.provider,
++    model: config.model,
++    state_db: config.state_db ?? '(default)',
++  })
+   install_weixin_connector(ctx, config as unknown as Parameters<typeof install_weixin_connector>[1])
+ }
+diff --git a/packages/webhook/webhook-weixin/src/reply/replyBuffer.ts b/packages/webhook/webhook-weixin/src/reply/replyBuffer.ts
+deleted file mode 100644
+index c637c40..0000000
+--- a/packages/webhook/webhook-weixin/src/reply/replyBuffer.ts
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/** 微信回复缓冲层：聚合 Harness assistant-stream 文本分片并保证最终只发送一次。 */
+-
+-export interface ReplySender {
+-  send_text(user_id: string, text: string, context_token?: string): Promise<void>
+-}
+-
+-/** 一个会话的一次 assistant 流式回复。 */
+-export class ReplyBuffer {
+-  private chunks: string[] = []
+-  private finished = false
+-
+-  /** 接收一个模型文本分片；非文本分片由调用方忽略。 */
+-  accept_chunk(chunk: unknown): void {
+-    if (this.finished) return
+-    if (typeof chunk === 'string') this.chunks.push(chunk)
+-    else if (chunk && typeof chunk === 'object' && 'text' in chunk && typeof chunk.text === 'string') this.chunks.push(chunk.text)
+-  }
+-
+-  /** 结束聚合并返回完整文本；重复结束只返回空结果。 */
+-  finish(): string {
+-    if (this.finished) return ''
+-    this.finished = true
+-    return this.chunks.join('')
+-  }
+-}
+-
+-/** 把 Harness assistant-stream 的提交结果发送回微信；仅提交一次最终文本。 */
+-export class ReplyBufferRouter {
+-  private readonly buffers = new Map<string, ReplyBuffer>()
+-
+-  /** 接收一个 Agent 流事件并在 committed end 时调用发送器。 */
+-  async accept_frame(
+-    session_id: string,
+-    frame: { type: string; chunk?: unknown; outcome?: { kind: string } },
+-    context: ReplySender & { user_id: string; context_token?: string },
+-  ): Promise<void> {
+-    let buffer = this.buffers.get(session_id)
+-    if (frame.type === 'start') {
+-      buffer = new ReplyBuffer()
+-      this.buffers.set(session_id, buffer)
+-      return
+-    }
+-    if (frame.type === 'chunk') {
+-      buffer ??= new ReplyBuffer()
+-      this.buffers.set(session_id, buffer)
+-      const chunk = frame.chunk
+-      if (chunk && typeof chunk === 'object' && 'type' in chunk && chunk.type === 'text-delta') buffer.accept_chunk(chunk)
+-      return
+-    }
+-    if (frame.type !== 'end' || frame.outcome?.kind !== 'committed' || !buffer) return
+-    this.buffers.delete(session_id)
+-    const text = buffer.finish().trim()
+-    if (text) await context.send_text(context.user_id, text, context.context_token)
+-  }
+-}
+diff --git a/packages/webhook/webhook-weixin/src/runtime/weixinConnector.ts b/packages/webhook/webhook-weixin/src/runtime/weixinConnector.ts
+index 2f5495a..1cbfd8c 100644
+--- a/packages/webhook/webhook-weixin/src/runtime/weixinConnector.ts
++++ b/packages/webhook/webhook-weixin/src/runtime/weixinConnector.ts
+@@ -1,66 +1,1450 @@
+-/** 微信连接器运行时：组合 iLink、持久路由、Harness Agent Host 和 Cordis effect 生命周期。 */
++﻿/**
++ * 微信连接器：把传输层、入站协调器、出站协调器与生命周期装配到一起。
++ *
++ * 重构后的职责边界（设计文档 §3.1）：
++ *   WeixinIngress       只拉取/规范化
++ *   InboundCoordinator  幂等、路由、控制、投递、恢复
++ *   OutboundCoordinator 唯一发送队列（含心跳与恢复）
++ *   本文件              只做装配、生命周期与 assistant-stream 桥接
++ *
++ * 本文件**不再**维护：delivery 去重、user→session 路由、回复缓冲、发送队列、per-session 心跳。
++ * @module dsh-webhook-weixin/connector
++ */
+ 
++import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { createHash, randomBytes } from 'node:crypto'
++import { spawn } from 'node:child_process'
++import { createConnection } from 'node:net'
++import type { Server } from 'node:http'
+ import type { Context } from '@deepseek-ai/cordis'
+ import type { Agent, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
++import { brandString } from '@deepseek-ai/dsh-brand'
++import type { SessionId } from '@deepseek-ai/dsh-session'
+ import { IlinkClient } from '../api/ilinkClient.ts'
+ import type { IlinkClientOptions } from '../api/ilinkTypes.ts'
+-import { UpdateMonitor, type MonitorObserver } from '../monitor/updateMonitor.ts'
+-import { SessionRouteStore } from '../session/sessionRouteStore.ts'
+-import { HarnessAgentHost, type HarnessAgentHostOptions } from '../session/harnessAgentHost.ts'
+-import { WeixinSessionAdapter, type WeixinAttachmentStore } from '../session/weixinSessionAdapter.ts'
+-import { ReplyBufferRouter, type ReplySender } from '../reply/replyBuffer.ts'
+-
+-export interface WeixinConnectorOptions extends IlinkClientOptions, HarnessAgentHostOptions {
+-  state_file: string
+-  observer?: MonitorObserver
++import { probe, probe_timer } from '../diagnostics/probe.ts'
++import { start_inject_server } from '../diagnostics/injectServer.ts'
++import {
++  clear_directory_contents,
++  delete_session_artifacts,
++  directory_bytes,
++  session_dir_path,
++  session_log_stats,
++  sessions_root,
++} from '../session/sessionFiles.ts'
++import { ConsumerLease, preflight_openclaw_isolation } from '../lifecycle/consumerLease.ts'
++import { CodexBridge, parse_codex_command } from '../coordination/codexBridge.ts'
++import { CodexWatcher } from '../coordination/codexWatcher.ts'
++import { OpencodeBridge, parse_opencode_command } from '../coordination/opencodeBridge.ts'
++import { OpencodeWatcher } from '../coordination/opencodeWatcher.ts'
++import { InboundCoordinator } from '../coordination/inboundCoordinator.ts'
++import { OutboundCoordinator } from '../coordination/outboundCoordinator.ts'
++import { ReplyAggregator } from '../reply/replyAggregator.ts'
++import { HarnessSessionHost, type WeixinAttachmentStore } from '../session/weixinSessionHost.ts'
++import { migrate_legacy_route_state } from '../state/migrateLegacyRouteState.ts'
++import { TimelineStore } from '../memory/timelineStore.ts'
++import { register_timeline_tools } from '../memory/timelineTools.ts'
++import { KnowledgeGraphStore } from '../memory/graphStore.ts'
++import { register_graph_tools } from '../memory/graphTools.ts'
++import { start_graph_scheduler, type GraphScheduler } from '../memory/graphScheduler.ts'
++import { create_gemma_gate, type GemmaGate } from '../memory/gemmaGate.ts'
++import { create_notify_settings, type NotifySettings } from '../coordination/notifySettings.ts'
++import { register_notify_tools } from '../coordination/notifyTools.ts'
++import { register_bridge_result_tools } from '../memory/bridgeResultTools.ts'
++import { register_bridge_session_tools } from '../coordination/bridgeSessionTools.ts'
++import { kill_external_runs } from '../coordination/externalRuns.ts'
++import {
++  ModelHealth,
++  classify_llm_failure,
++  cooldown_ms,
++  find_model_config,
++  next_alive_candidate,
++  parse_failover_config,
++  type FailoverReason,
++  type ModelCandidate,
++} from './modelFailover.ts'
++import { create_gemma_summarizer } from '../memory/gemmaSummarizer.ts'
++import { create_memory_model, type MemoryEngine, type MemoryModel } from '../memory/memoryModel.ts'
++import { start_timeline_scheduler, type TimelineScheduler } from '../memory/timelineScheduler.ts'
++import type { TimelineAttachment, TimelineEntry } from '../memory/timelineTypes.ts'
++import type { NormalizedMedia } from '../message/messageNormalizer.ts'
++import { WeixinStateStore } from '../state/weixinStateStore.ts'
++import { TurnContextStore } from '../state/turnContextStore.ts'
++import { WeixinIngress } from '../transport/weixinIngress.ts'
++
++/** 连接器配置。 */
++export interface WeixinConnectorOptions extends IlinkClientOptions {
++  /** SQLite 状态库路径；默认落在状态文件同目录。 */
++  readonly state_db?: string
++  /** preset id。 */
++  readonly agent_preset?: string
++  /** 工作目录。 */
++  readonly workspace_path?: string
++  /** 模型 provider / model（记录进 Session 元数据，并传给 Agent 解析提示变量）。 */
++  readonly provider?: string
++  readonly model?: string
++  /** 推理强度（可选）。 */
++  readonly reasoning_effort?: string
++  /** lease 标记文件（诊断用）。 */
++  readonly lease_marker?: string
++  /** 是否检查 OpenClaw 隔离；默认 true。 */
++  readonly enforce_openclaw_isolation?: boolean
++  /** 旧版路由状态文件路径（仅用于一次性迁移；迁移后只读保留）。 */
++  readonly state_file?: string
++  /** `/codex` 远程任务的工作目录；默认 SynLove。 */
++  readonly codex_workspace?: string
++  /** 长期记忆（时间线）根目录；默认 ~/.dsh/timeline。 */
++  readonly timeline_dir?: string
++  /** 知识图谱（社交网络）根目录；默认 ~/.dsh/graph。 */
++  readonly graph_dir?: string
++}
++
++/** 项目目录（启动器注入）；用它定位 `config/modelConfig.json` 等配置文件。 */
++const PROJECT_CONFIG_DIR = process.env.DSH_WEIXIN_WORKSPACE ?? process.cwd()
++
++/** 探测某个本地端口是否在监听（用于判断 Gemma 服务是否就绪）。 */
++function port_open(port: number): Promise<boolean> {
++  return new Promise(resolve => {
++    const socket = createConnection({ port, host: '127.0.0.1' })
++    const finish = (value: boolean): void => { socket.destroy(); resolve(value) }
++    socket.setTimeout(1_500)
++    socket.once('connect', () => finish(true))
++    socket.once('timeout', () => finish(false))
++    socket.once('error', () => finish(false))
++  })
+ }
+ 
+-/** 可被 Cordis effect 管理的微信连接器。 */
++/** 退避序列（毫秒）。 */
++const BACKOFF_STEPS = [1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
++
++/**
++ * 思考摘要推送的最小间隔（毫秒）。
++ *
++ * 旧逻辑是"每 2 次工具调用推一次"，但很多任务只调 1 次工具（甚至 0 次），
++ * 于是用户全程看不到任何进度——明明模型一直在输出思考。
++ * 改成按时间驱动：只要距上次推送超过该间隔，就把新累积的思考摘要发一条。
++ * 可用 DSH_WEIXIN_PROGRESS_INTERVAL_MS 调整；设为 0 关闭。
++ */
++const PROGRESS_MIN_INTERVAL_MS = Number(process.env.DSH_WEIXIN_PROGRESS_INTERVAL_MS ?? '25000')
++
++/** 摘要太短就不值得单独发一条（避免刷屏）。 */
++const PROGRESS_MIN_CHARS = 12
++
++/**
++ * turn 绑定的有效期（毫秒）。
++ * 超过就认为是"重启前遗留的绑定"并强制重绑：turn 号会重复，但 context_token 可能已过期，
++ * 复用旧 token 会让回复被判 `prepare failed`。
++ */
++const BINDING_TTL_MS = Number(process.env.DSH_WEIXIN_BINDING_TTL_MS ?? String(30 * 60_000))
++
++/**
++ * agent 报错后等多久没有恢复，就把这一轮按失败收尾（毫秒）。
++ *
++ * 取 60 秒：harness 的 llm-retry 是"秒级退避重试"，重试成功的话新分片很快就会到；
++ * 60 秒还没有任何输出，基本就是额度/鉴权这类**重试也没用**的错误，早点告诉用户。
++ */
++const AGENT_ERROR_GRACE_MS = Number(process.env.DSH_WEIXIN_AGENT_ERROR_GRACE_MS ?? '60000')
++
++/**
++ * 账号指纹：给日志/租约用的**不可逆**身份标识。
++ *
++ * 以前用的是 `token.slice(0, 16)`——那是 token 的明文片段，会出现在探针日志、
++ * 租约标记文件和启动日志里，而它们都在项目目录内（会被一起拷走）。
++ * 现在改成 sha256 前 12 位：同一账号稳定可区分，但反推不出 token。
++ *
++ * @param token - 微信 bot token；缺失时返回 `'unknown'`。
++ */
++function account_fingerprint(token: string | undefined): string {
++  if (token === undefined || token === '') return 'unknown'
++  return 'acct-' + createHash('sha256').update(token).digest('hex').slice(0, 12)
++}
++
++/** 读一个 JSON 文件；读不到或坏了返回空对象（调用方都按"缺省"处理）。 */
++function read_json_file(path: string): Record<string, unknown> {
++  try {
++    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
++  } catch {
++    return {}
++  }
++}
++
++
++
++/** 微信连接器：装配 + 生命周期。 */
+ export class WeixinConnector {
+-  private readonly host: HarnessAgentHost
+-  private readonly monitor: UpdateMonitor
+-  private readonly controller = new AbortController()
+-  private readonly reply_router = new ReplyBufferRouter()
+-  private readonly adapter: WeixinSessionAdapter
++  private readonly store: WeixinStateStore
++  private readonly turn_context: TurnContextStore
++  private readonly ingress: WeixinIngress
++  private readonly inbound: InboundCoordinator
++  private readonly outbound: OutboundCoordinator
++  private readonly host: HarnessSessionHost
++  private readonly lease: ConsumerLease
+   private readonly client: IlinkClient
++  /** Codex 远程桥（`/codex` 指令）。 */
++  private readonly codex_bridge: CodexBridge
++  /** Codex 任务完成监视器：任务一结束就主动推微信。 */
++  private readonly codex_watcher: CodexWatcher
++  /** opencode 远程桥（`/opencode` 指令）。 */
++  private readonly opencode_bridge: OpencodeBridge
++  /** opencode 完成监视器：只汇报外部发起的任务。 */
++  private readonly opencode_watcher: OpencodeWatcher
++  private readonly controller = new AbortController()
++  private readonly stream_disposers = new Map<string, () => void>()
++  /** 每个 Stream 的工具调用计数（用于"每 N 次工具调用推一次摘要"）。 */
++  private readonly tool_calls_seen = new Map<string, Set<string>>()
++  /**
++   * 每个 Session 当前所在的 turn。
++   * 只有 `start` 帧带 `turn`；`chunk`/`end` 帧不带，因此必须记住最近一次的 turn，
++   * 否则 turn context 会全部绑到 0（绑定/查询错位）。
++   */
++  private readonly current_turn = new Map<string, number>()
++  /**
++   * 待定的"这一轮失败了"收尾定时器（agent 报错后等宽限期，没有恢复就收尾）。
++   * 没有它的话，模型持续报错时这一轮会永远停在"处理中"。
++   */
++  private readonly turn_failure_timers = new Map<string, ReturnType<typeof setTimeout>>()
++  /** 当前在用的模型（故障转移会改它；初值来自配置）。 */
++  private current_model: ModelCandidate = { provider: '', model: '' }
++  /** 模型健康表：失活的 API 在冷却期内不再被选。 */
++  private readonly model_health = new ModelHealth()
++  /** 每个会话最近一条用户消息（换模型后要重做它）。 */
++  private readonly last_user_message = new Map<string, {
++    user_id: string, text: string, at: number, retried: boolean
++  }>()
++  /** 本轮是否报过错（用于"整轮失败却一个字都没发"时补一条说明）。 */
++  private readonly turn_error = new Map<string, string>()
++  /** 本轮有没有成功发出过正文。 */
++  private readonly turn_visible = new Set<string>()
++  /** 每个 Session 上次推送思考摘要的时间（进度节流）。 */
++  private readonly last_progress_at = new Map<string, number>()
++  private readonly aggregators = new Map<string, ReplyAggregator>()
+   private running: Promise<void> | undefined
++  private stopped = false
++  /** 本机调试注入口（仅当设置 DSH_WEIXIN_INJECT_PORT 时启用）。 */
++  private inject_server: Server | undefined
++  /** 长期记忆（时间线）；DSH_TIMELINE_ENABLED=0 可整体关闭。 */
++  private readonly timeline: TimelineStore | undefined
++  /** 知识图谱（社交网络）：人物 + "谁称呼谁为什么"的有向边。 */
++  private readonly graph: KnowledgeGraphStore
++  /** 会话工作目录（会话落盘路径由它推导，必须与 HarnessSessionHost 一致）。 */
++  private readonly workspace_path: string = process.cwd()
++  /** 通知开关：codex / opencode 的完成汇报是否推送。 */
++  private readonly notify: NotifySettings
++  /** 摘要调度器（低频、纯本地检查；与 iLink 轮询无关）。 */
++  private timeline_scheduler: TimelineScheduler | undefined
++  /** 知识图谱的空闲增量更新调度器。 */
++  private graph_scheduler: GraphScheduler | undefined
++  /**
++   * 记忆更新的模型客户端：本地 Gemma 或云端模型（由 `DSH_MEMORY_ENGINE` 决定）。
++   *
++   * 本地免费但要占约 5.3GB 显存；云端不占显存但花额度。用户可在控制台切换。
++   */
++  private readonly memory: MemoryModel
++  /**
++   * 后台任务的闸门（摘要 / 图谱 / 图片描述共用）。
++   *
++   * 本地引擎：并发 1 + **等显存空闲再启动**（用户可能在跑游戏/训练）；
++   * 云端引擎：不等显存（本来就不占），但同样限制并发，避免把额度打爆。
++   */
++  private readonly gemma: GemmaGate
++
++  /** 组装全部组件；构造期不做 IO 失败判定。 */
++  /** 宿主 ctx（故障转移要经它取 sessionController）。 */
++  private readonly ctx: Context
+ 
+-  /** 创建连接器并组装全部协议和 Harness 生命周期组件。 */
+   constructor(ctx: Context, options: WeixinConnectorOptions) {
+-    this.host = new HarnessAgentHost(ctx, options)
+-    const routes = new SessionRouteStore(options.state_file)
+-    const attachments = ctx.get('attachments') as WeixinAttachmentStore | undefined
+-    this.adapter = new WeixinSessionAdapter(this.host, routes, attachments)
++    this.ctx = ctx
++    const db_path = options.state_db ?? join(join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh')), 'weixin-state.db')
++    this.store = new WeixinStateStore({ path: db_path })
++    // 阶段 5：把旧 JSON 路由状态迁移进 SQLite（只在目标库为空时执行；失败 fail closed）。
++    // 旧文件保持只读，迁移会先复制一份 .migrated-<时间戳> 副本。
++    const legacy_path = options.state_file
++      ?? join(process.env.DSH_WEIXIN_STATE_FILE ?? join(process.cwd(), 'runtime', 'weixin-route-state.json'))
++    const migration = migrate_legacy_route_state(this.store, legacy_path)
++    probe('lifecycle', 'migration.result', { ...migration })
++    this.turn_context = new TurnContextStore(this.store)
++    // 长期记忆（时间线）：默认开启，写到 ~/.dsh/timeline（可用 DSH_TIMELINE_DIR 改）。
++    const timeline_enabled = process.env.DSH_TIMELINE_ENABLED !== '0'
++    this.timeline = timeline_enabled
++      ? new TimelineStore({
++        dir: options.timeline_dir
++          ?? process.env.DSH_TIMELINE_DIR
++          ?? join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh'), 'timeline'),
++        ...process.env.DSH_TIMELINE_TIMEZONE === undefined
++          ? {}
++          : { timezone: process.env.DSH_TIMELINE_TIMEZONE },
++      })
++      : undefined
++    // 知识图谱与时间线同级存放（默认 ~/.dsh/graph）。
++    this.graph = new KnowledgeGraphStore({
++      dir: options.graph_dir
++        ?? process.env.DSH_GRAPH_DIR
++        ?? join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh'), 'graph'),
++    })
++    // 启动即把中心建好（幂等）：欣爱为绝对中心，另有主人节点与两人互相的称呼。
++    // 不等到第一次空闲更新——否则刚启动时查询工具会告"图谱里还没有任何人物"。
++    try {
++      this.graph.ensure_center()
++      probe('graph', 'center.ready', { ...this.graph.stats() })
++    } catch (error) {
++      probe('graph', 'center.failed', { error: String(error) })
++    }
++    // 通知开关（codex / opencode 的完成汇报是否推送），存在状态库 meta 里。
++    this.notify = create_notify_settings(this.store)
++    // 记忆更新引擎：本地 Gemma（默认）或云端模型。后者在显存被占用时也能推进记忆。
++    const engine: MemoryEngine = process.env.DSH_MEMORY_ENGINE === 'cloud' ? 'cloud' : 'gemma'
++    this.memory = create_memory_model({
++      engine,
++      ...process.env.DSH_MEMORY_CLOUD_MODEL === undefined
++        ? {}
++        : { cloud_model: process.env.DSH_MEMORY_CLOUD_MODEL },
++      // 同一个"路径要带 config/ 子目录"的坑：找不到就交给记忆模型自己回退到本地引擎
++      config_path: find_model_config(PROJECT_CONFIG_DIR) ?? join(PROJECT_CONFIG_DIR, 'config', 'modelConfig.json'),
++    })
++    this.gemma = create_gemma_gate({
++      // 只有本地引擎才需要等显存（云端不占显存，等了也没意义）
++      min_free_vram_mb: engine === 'gemma'
++        ? Number(process.env.DSH_GEMMA_MIN_FREE_VRAM_MB ?? '5200')
++        : 0,
++      ...engine === 'gemma' ? { ensure_ready: () => this.ensure_gemma_running() } : {},
++    })
++    probe('lifecycle', 'memory_engine', { engine, label: this.memory.label })
+     this.client = new IlinkClient(options)
+-    const sender: ReplySender = { send_text: (user_id, text, context_token) => this.client.send_message_with_retry({ to_user_id: user_id, text, ...context_token === undefined ? {} : { context_token } }) }
+-    ctx.on('agent/assistant-stream', ({ agent, frame }: { agent: Agent; frame: AssistantStreamFrame }) => {
+-      const reply = this.adapter.get_reply_context(String(agent.id))
+-      if (!reply) return
+-      void this.reply_router.accept_frame(String(agent.id), frame, { ...sender, ...reply }).catch(error => options.observer?.on_error?.(error))
++    // 会话文件的工程目录名由 cwd 推导，必须和 HarnessSessionHost 用的是同一个值。
++    this.workspace_path = options.workspace_path ?? process.cwd()
++    // 当前模型：故障转移的起点（之后由 selectModel 改动）
++    this.current_model = {
++      provider: options.provider ?? '',
++      model: options.model ?? '',
++    }
++    this.host = new HarnessSessionHost(ctx, {
++      ...options.agent_preset === undefined ? {} : { agent_preset: options.agent_preset },
++      workspace_path: options.workspace_path ?? process.cwd(),
++      ...options.provider === undefined ? {} : { provider: options.provider },
++      ...options.model === undefined ? {} : { model: options.model },
++      ...options.reasoning_effort === undefined ? {} : { reasoning_effort: options.reasoning_effort },
++    })
++    this.lease = new ConsumerLease({
++      store: this.store,
++      // 租约身份**不要用 token 片段**：日志、探针、租约标记文件里都会写它，
++      // 而这些文件就在项目内（随项目一起被拷走/备份）。用不可逆哈希，既能区分账号，
++      // 又不泄漏 token 的任何字符。
++      account_id: account_fingerprint(options.token),
++      ...options.lease_marker === undefined ? {} : { marker_path: options.lease_marker },
++    })
++    this.ingress = new WeixinIngress({
++      client: this.client,
++      observer: {
++        on_error: error => probe('ingress', 'observer.error', { error: String(error) }),
++        on_status: (status, detail) => probe('ingress', 'observer.status', { status, detail }),
++      },
++    })
++    this.outbound = new OutboundCoordinator({
++      store: this.store,
++      turn_context: this.turn_context,
++      sender: async input => {
++        await this.client.send_message_with_retry({
++          to_user_id: input.user_id,
++          text: input.text,
++          client_id: input.client_id,
++          ...input.context_token === undefined ? {} : { context_token: input.context_token },
++        })
++      },
++      record_entry: entry => { this.record_timeline(entry) },
++      classify_retryable: error => {
++        const retryable = (error as { retryable?: boolean } | undefined)?.retryable
++        // 明确标注不可重试才放弃；未标注的按可重试处理（网络抖动居多）。
++        return retryable !== false
++      },
++    })
++    const attachments = ctx.get('attachments') as WeixinAttachmentStore | undefined
++    // Codex 远程桥：`/codex ...` 由它处理，输出通过同一 outbox 主动推回微信。
++    this.codex_bridge = new CodexBridge(
++      this.store,
++      (user_id, session_id, text, kind, context_token) => {
++        this.outbound.enqueue_notice({
++          session_id,
++          user_id,
++          kind,
++          text,
++          ...context_token === undefined ? {} : { context_token },
++        })
++        void this.outbound.drain()
++      },
++      options.codex_workspace ?? process.env.DSH_CODEX_WORKSPACE,
++    )
++    // opencode 远程桥：`/opencode ...` 由它处理，输出主动推微信（带硬超时）。
++    this.opencode_bridge = new OpencodeBridge(
++      this.store,
++      (user_id, session_id, text, kind, context_token) => {
++        this.outbound.enqueue_notice({
++          session_id, user_id, kind, text,
++          ...context_token === undefined ? {} : { context_token },
++        })
++        void this.outbound.drain()
++      },
++    )
++    // opencode 完成监视器：只汇报"外部发起"的 opencode 任务（微信发起的由桥自己汇报）。
++    this.opencode_watcher = new OpencodeWatcher({
++      store: this.store,
++      push: (user_id, text) => {
++        // 用户可以用 notify_control 关掉这类被动汇报（真实对话回复不受影响）。
++        if (!this.notify.is_enabled('opencode')) {
++          probe('opencode-watch', 'notify.suppressed')
++          return
++        }
++        const session_id = this.store.get_session_id(user_id) ?? `weixin-${user_id}`
++        this.outbound.enqueue_notice({ session_id, user_id, kind: 'assistant', text })
++        void this.outbound.drain()
++      },
++    })
++    // Codex 完成监视器：轮询 ~/.codex 的会话状态，任务结束就通过 outbox 主动推微信。
++    this.codex_watcher = new CodexWatcher({
++      store: this.store,
++      push: (user_id, text) => {
++        if (!this.notify.is_enabled('codex')) {
++          probe('codex-watch', 'notify.suppressed')
++          return
++        }
++        const session_id = this.store.get_session_id(user_id) ?? `weixin-${user_id}`
++        this.outbound.enqueue_notice({ session_id, user_id, kind: 'assistant', text })
++        void this.outbound.drain()
++      },
++    })
++    this.inbound = new InboundCoordinator({
++      store: this.store,
++      turn_context: this.turn_context,
++      host: this.host,
++      ...attachments === undefined ? {} : { attachments },
++      enqueue_outbound: input => { this.outbound.enqueue_notice(input) },
++      on_agent_ready: agent => { this.bind_agent_stream(agent) },
++      on_user_message: (session_id, user_id, text) => { this.remember_user_message(session_id, user_id, text) },
++      // 用户说"停止"：除了取消模型那一轮，还要**真的把外部任务杀掉**
++      // （桥里的任务 + 模型用工具起的 opencode/codex 进程）。
++      on_cancel: async user_id => {
++        this.opencode_bridge.stop(user_id)
++        this.codex_bridge.stop(user_id)
++        const result = kill_external_runs()
++        probe('inbound', 'cancel.external_runs', { user_id, killed: result.killed, pids: [...result.pids] })
++        return { killed: result.killed, pids: result.pids }
++      },
++      codex_bridge: {
++        parse: text => parse_codex_command(text),
++        handle: (user_id, session_id, command, context_token) =>
++          this.codex_bridge.handle(user_id, session_id, command, context_token),
++      },
++      opencode_bridge: {
++        parse: text => parse_opencode_command(text),
++        handle: (user_id, session_id, command, context_token) =>
++          this.opencode_bridge.handle(user_id, session_id, command, context_token),
++      },
++      // 媒体补全真正接上：不接的话图片/文件/语音只会变成 `[微信媒体 image]` 占位文字。
++      // 顺带把媒体记进长期记忆（原图存附件库、只留引用；描述后台补写）。
++      hydrate_message: async message => {
++        const hydrated = await this.ingress.media_normalizer.hydrate_media(
++          message,
++          media => this.ingress.download_media(media),
++        )
++        await this.record_media_to_timeline(hydrated, attachments).catch(error => {
++          probe('timeline', 'media.record_failed', { error: String(error) })
++        })
++        return hydrated
++      },
++      // 长期记忆：用户上行落盘（幂等，重放不会重复记）。
++      record_entry: entry => { this.record_timeline(entry) },
++    })
++    probe('lifecycle', 'connector.constructed', {
++      db_path, preset: options.agent_preset ?? '(default)', workspace: options.workspace_path,
+     })
+-    this.monitor = new UpdateMonitor(this.client, routes, this.adapter, options.observer)
+   }
+ 
+-  /** 启动一次可取消的 getUpdates 监控循环。 */
+-  start_connector(): Promise<void> {
+-    this.running ??= this.monitor.run(this.controller.signal)
++  /**
++   * 启动：preflight → 装配检查 → lease → 恢复 → 开轮询。
++   * 任一步失败都抛出，让上层把"微信消费者未启动"如实暴露出来（禁止假成功）。
++   */
++  async start(): Promise<void> {
++    if (this.running !== undefined) return this.running
++    this.running = this.run()
+     return this.running
+   }
+ 
+-  /** 取消轮询、等待退出并销毁本连接器创建的 Agent。 */
+-  async stop_connector(): Promise<void> {
++  /** 真正的启动序列。 */
++  private async run(): Promise<void> {
++    // 1. OpenClaw 隔离 preflight（设计文档 §9.2）。
++    if (process.env.DSH_WEIXIN_SKIP_OPENCLAW_CHECK !== '1') {
++      const isolation = preflight_openclaw_isolation()
++      if (!isolation.ok) {
++        throw new Error(
++          'webhook-weixin: OpenClaw 隔离检查未通过，拒绝启动：\n  - ' + isolation.problems.join('\n  - ')
++          + '\n请先停用 OpenClaw 的微信通道（openclaw-weixin.enabled=false）。',
++        )
++      }
++    }
++    // 2. Harness 能力装配检查（设计文档 §9.3）。
++    this.host.assert_capabilities()
++    // 3. 原子 lease（失败必须致命）。
++    this.lease.acquire()
++    // 4. 恢复未完成状态。
++    const recovered = await this.inbound.recover_unfinished()
++    const pending = await this.outbound.recover_pending()
++    probe('lifecycle', 'recover.summary', { ...recovered, outbox_pending: pending })
++    console.error(`[webhook-weixin] 启动恢复：delivery=${recovered.recovered} outbox=${pending}；` +
++      `状态快照 ${JSON.stringify(this.store.snapshot())}`)
++    // 4.5 启动完成监视（被动通知：外部发起的任务一结束就推微信）。
++    // 注意分工：微信 `/codex` `/opencode` 发起的任务由各自桥汇报，监视器只盯外部发起的。
++    this.codex_watcher.start()
++    this.opencode_watcher.start()
++    // 4.6 本机调试注入口（默认关闭；仅在显式设置 DSH_WEIXIN_INJECT_PORT 时开启）。
++    this.start_inject_server_if_configured()
++    // 4.7 长期记忆摘要调度（低频、纯本地，与 iLink 轮询解耦）。
++    this.start_timeline_scheduler_if_enabled()
++    // 5. 通知上线并开始轮询。
++    try {
++      await this.ingress.notify_start(this.controller.signal)
++      await this.poll_loop()
++    } finally {
++      await this.ingress.notify_stop(this.controller.signal)
++    }
++  }
++
++  /**
++   * 启动本机注入口（开发设施，默认关闭）。
++   *
++   * 用途：把一条"用户消息"塞进真实入站管线（delivery → 协调器 → agent → outbox → 微信），
++   * 这样测试时不必每次都用真手机发微信。只绑 127.0.0.1，且只有设置端口才启用。
++   */
++  private start_inject_server_if_configured(): void {
++    const port = Number(process.env.DSH_WEIXIN_INJECT_PORT ?? '0')
++    if (!Number.isInteger(port) || port <= 0) return
++    this.inject_server = start_inject_server({
++      port,
++      inject: input => this.inject_test_message(input),
++      admin: (action, body) => this.admin_action(action, body),
++    })
++  }
++
++  /**
++   * 管理动作分发（控制台按钮走这里）。
++   *
++   * 之所以由本进程执行而不是让控制台直接删文件：时间线/图谱有内存缓存、
++   * 会话上下文还被 agent 句柄持有——只有持有者才知道该怎么正确清。
++   */
++  private async admin_action(action: string, body: Record<string, unknown>): Promise<unknown> {
++    const user_id = typeof body.user_id === 'string' && body.user_id !== '' ? body.user_id : undefined
++    switch (action) {
++      case 'clear-context':
++        return this.clear_context(user_id === undefined ? {} : { user_id })
++      case 'clear-memory': {
++        const target = String(body.target ?? '')
++        if (target !== 'timeline' && target !== 'graph') {
++          throw new Error(`clear-memory 的 target 只能是 timeline 或 graph，收到：${target}`)
++        }
++        return this.clear_memory(target)
++      }
++      case 'memory-stats':
++        return this.memory_stats()
++      case 'clear-queue':
++        return { removed: this.store.clear_queue() }
++      case 'failover-status': {
++        const path = find_model_config(PROJECT_CONFIG_DIR)
++        const config = path === undefined ? {} : read_json_file(path)
++        return {
++          current: this.current_model,
++          order: parse_failover_config(config).order,
++          dead: this.model_health.snapshot(),
++        }
++      }
++      case 'reload-preset':
++        return this.reload_preset()
++      default:
++        throw new Error(`未知的管理动作：${action}`)
++    }
++  }
++
++  /**
++   * 清空长期记忆。
++   *
++   * - `timeline`：删掉时间线目录内容，并清掉存储层的内存缓存（否则还会列出已删的天）；
++   * - `graph`：删掉图谱目录内容 → **重建中心**（欣爱 + 主人，否则查询会说"图谱里没有人"）
++   *   → 水位归零（让图谱从现有历史里重新长出来）。
++   *
++   * 与"清空上下文"是两件事：这里清的是"她长期记得什么"，上下文是"这次聊天记得什么"。
++   */
++  private clear_memory(target: 'timeline' | 'graph'): {
++    target: string
++    files: number
++    bytes: number
++    dir: string
++    note?: string
++  } {
++    if (target === 'timeline') {
++      if (this.timeline === undefined) {
++        return { target, files: 0, bytes: 0, dir: '', note: '时间线记忆未启用（DSH_TIMELINE_ENABLED=0）' }
++      }
++      const removed = clear_directory_contents(this.timeline.dir_path())
++      // 清空会把 days/ 一起删掉；store 是长驻实例，必须显式重建目录，
++      // 否则下一次记录会 ENOENT（2026-09-21 23:46 那轮踩过）。
++      this.timeline.ensure_dirs()
++      this.timeline.forget_caches()
++      probe('memory', 'timeline.cleared', { ...removed })
++      return { target, ...removed }
++    }
++    const removed = clear_directory_contents(this.graph.dir_path())
++    this.graph.ensure_center()
++    this.graph.reset_watermark()
++    probe('memory', 'graph.cleared', { ...removed })
++    return {
++      target, ...removed,
++      note: `已重建中心（欣爱 · 主人），并归零水位；下次空闲时会从现有历史里重新积累`,
++    }
++  }
++
++  /**
++   * 三类记忆的体量（控制台展示用）。
++   *
++   * 上下文的体量按**落盘会话文件**算（用户 id → 会话 id → 会话目录），
++   * 所以它显示的是真实占用，而不是一个估计值。
++   */
++  private memory_stats(): {
++    timeline: { days: number, entries: number, bytes: number, dir: string } | { error: string }
++    graph: { people: number, relations: number, bytes: number, dir: string } | { error: string }
++    context: { users: Array<{ user_id: string, session_id: string, epoch: number, online: boolean, bytes: number, modified_at: number }>, bytes: number }
++  } {
++    const stats = this.timeline === undefined
++      ? { error: '时间线记忆未启用' } as { error: string }
++      : (() => {
++        const summary = this.timeline!.stats() as { days?: number, entries?: number }
++        return {
++          days: summary.days ?? 0,
++          entries: summary.entries ?? 0,
++          bytes: directory_bytes(this.timeline!.dir_path()),
++          dir: this.timeline!.dir_path(),
++        }
++      })()
++
++    const graph_stats = (() => {
++      const summary = this.graph.stats()
++      return {
++        people: summary.people,
++        relations: summary.relations,
++        bytes: directory_bytes(this.graph.dir_path()),
++        dir: this.graph.dir_path(),
++      }
++    })()
++
++    const root = sessions_root()
++    const users = this.store.list_users().map(user_id => {
++      const session_id = this.store.get_session_id(user_id) ?? this.store.session_id_for(user_id)
++      const log = session_log_stats(session_dir_path(root, this.workspace_path, session_id))
++      return {
++        user_id,
++        session_id,
++        epoch: this.store.context_epoch(user_id),
++        online: this.host.get_agent(brandString<SessionId>(session_id)) !== undefined,
++        bytes: log?.bytes ?? 0,
++        modified_at: log?.modified_at ?? 0,
++      }
++    })
++    return {
++      timeline: stats,
++      graph: graph_stats,
++      context: { users, bytes: users.reduce((sum, item) => sum + item.bytes, 0) },
++    }
++  }
++
++  /**
++   * 清空对话上下文（控制台「清空上下文」按钮调这里）。
++   *
++   * 四步，顺序不能换：
++   * 1. **dispose agent**：只有 owner 释放才会关掉会话日志的写句柄。
++   *    若跳过这步直接删文件，残留句柄下次 append 会写出"没有 header 的坏文件"——
++   *    那个会话以后再也恢复不起来（这是实测踩过的坑）。
++   * 2. 丢掉该会话的内存残留（stream/turn/聚合器）。
++   * 3. **尽力删除旧会话文件**：回收磁盘；删不掉也不影响结果（见第 4 步）。
++   * 4. **清路由 + 代次 +1**：下一条消息因此拿到一个新会话 id → 必然是空上下文。
++   *
++   * 长期记忆（时间线/图谱）**不动**：上下文是"这次聊天记得什么"，
++   * 长期记忆是"她这个人记得什么"，两者是分开的，各有各的清空入口。
++   */
++  private async clear_context(input: { user_id?: string }): Promise<{
++    users: Array<{ user_id: string, session_id: string, disposed: boolean, deleted: boolean, note?: string }>
++    epochs: Record<string, number>
++  }> {
++    const users = input.user_id === undefined || input.user_id === ''
++      ? this.store.list_users()
++      : [input.user_id]
++    const epochs: Record<string, number> = {}
++    const results: Array<{ user_id: string, session_id: string, disposed: boolean, deleted: boolean, note?: string }> = []
++    for (const user_id of users) {
++      const session_id = this.store.get_session_id(user_id)
++        ?? this.store.session_id_for(user_id)
++      const disposed = await this.host.dispose_agent(session_id)
++      this.forget_session(session_id)
++      const deletion = delete_session_artifacts({
++        root: sessions_root(),
++        cwd: this.workspace_path,
++        id: session_id,
++      })
++      this.store.clear_session_id(user_id)
++      epochs[user_id] = this.store.bump_context_epoch(user_id)
++      results.push({
++        user_id,
++        session_id,
++        disposed,
++        deleted: deletion.deleted,
++        ...deletion.reason === undefined ? {} : { note: deletion.reason },
++      })
++      probe('lifecycle', 'context.cleared', {
++        user_id, session_id, disposed, deleted: deletion.deleted, epoch: epochs[user_id],
++      })
++    }
++    return { users: results, epochs }
++  }
++
++  /**
++   * 重新解析 preset（GUI 挂载/卸载工具后调用），并**真的验证一次**。
++   *
++   * 为什么要在本进程做：preset 组合是宿主实例记忆的，必须由持有它的进程重置。
++   * 验证方式是用一个探针会话真创建一次 Agent —— preset 里挂了个缺依赖的插件时，
++   * 失败会在这里暴露（而不是等到用户下一条消息才发现 bot 不回话了），
++   * 验证完立刻释放并删掉探针会话文件，不留痕迹。
++   */
++  private async reload_preset(): Promise<{ reloaded: boolean }> {
++    this.host.reset_composition()
++    const probe_id = `preset-check-${Date.now().toString(36)}`
++    let failure = ''
++    try {
++      await this.host.create_agent(brandString<SessionId>(probe_id))
++    } catch (error) {
++      failure = error instanceof Error ? error.message : String(error)
++    } finally {
++      await this.host.dispose_agent(probe_id)
++      delete_session_artifacts({ root: sessions_root(), cwd: this.workspace_path, id: probe_id })
++    }
++    if (failure !== '') {
++      probe('lifecycle', 'preset.reload_failed', { error: failure })
++      throw new Error(`preset 组装失败，已回滚：${failure}`)
++    }
++    probe('lifecycle', 'preset.reloaded', {})
++    return { reloaded: true }
++  }
++
++  /** 丢掉某个会话在内存里的残留状态（上下文已经清掉，这些映射不能再留着）。 */
++  private forget_session(session_id: string): void {
++    try {
++      this.stream_disposers.get(session_id)?.()
++    } catch (error) {
++      probe('lifecycle', 'context.dispose_failed', { session_id, error: String(error) })
++    }
++    this.stream_disposers.delete(session_id)
++    this.tool_calls_seen.delete(session_id)
++    this.current_turn.delete(session_id)
++    this.last_progress_at.delete(session_id)
++    this.aggregators.delete(session_id)
++  }
++
++  /** 注入一条测试消息：复用真实入站管线，但不提交 iLink 游标（它本来就不是 iLink 来的）。 */
++  private async inject_test_message(input: { text: string; user_id?: string }): Promise<{ delivery_id: string; session_id?: string }> {
++    const user_id = input.user_id ?? this.store.latest_user_id()
++    if (user_id === undefined) {
++      throw new Error('还没有任何入站用户，无法确定收件人；请先用真实微信发一条消息')
++    }
++    const delivery_id = `inject-${Date.now()}-${randomBytes(4).toString('hex')}`
++    probe('inbound', 'inject.accepted', {
++      delivery_id, user_id, text_len: input.text.length, text: input.text.slice(0, 120),
++    })
++    await this.inbound.handle_batch([{
++      delivery_id,
++      user_id,
++      text: input.text,
++      media: [],
++      received_at: Date.now(),
++    }], undefined)
++    return {
++      delivery_id,
++      ...this.store.get_session_id(user_id) === undefined
++        ? {}
++        : { session_id: this.store.get_session_id(user_id) as string },
++    }
++  }
++
++  /**
++   * 把消息里的媒体记进长期记忆。
++   *
++   * 分两步，且都**不阻塞**用户这条消息的处理：
++   * 1. 解析出附件引用（原图由 harness 附件服务按内容寻址存好，天然去重），
++   *    把引用挂到当天那条记录上——**不复制文件**，所以"存原图"几乎零成本；
++   * 2. 后台让视觉模型（Gemma + mmproj）写一句描述，回填到引用上——
++   *    描述让"发了什么图"变成可检索文本，并会随当天摘要一起被总结。
++   *
++   * 原图永远是权威：描述错了、模型不在线，都不影响原始事实已经存下来了。
++   */
++  private async record_media_to_timeline(
++    message: { delivery_id: string, received_at: number, media: readonly NormalizedMedia[] },
++    attachments: WeixinAttachmentStore | undefined,
++  ): Promise<void> {
++    if (this.timeline === undefined || attachments === undefined) return
++    const images = message.media.filter(item => item.kind === 'image' && item.data !== undefined)
++    if (images.length === 0) return
++    const date = this.timeline.day_key(message.received_at)
++
++    const refs: TimelineAttachment[] = []
++    for (const item of images) {
++      try {
++        const ref = await attachments.saveImage({
++          data: item.data as Uint8Array,
++          mediaType: (item.mime_type ?? 'image/jpeg') as 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif',
++          ...item.name === undefined ? {} : { name: item.name },
++        })
++        refs.push({
++          id: String(ref.attachmentId),
++          media_type: ref.mediaType,
++          bytes: ref.bytes,
++          width: ref.width,
++          height: ref.height,
++          ...ref.name === undefined ? {} : { name: ref.name },
++        })
++      } catch (error) {
++        probe('timeline', 'media.save_failed', { error: String(error) })
++      }
++    }
++    if (refs.length === 0) return
++    this.timeline.update_entry(date, message.delivery_id, { attachments: refs })
++    probe('timeline', 'media.recorded', { date, delivery_id: message.delivery_id, count: refs.length })
++
++    // 后台补描述：失败只留痕（原图已经在附件库里，不会因为描述失败而丢）。
++    for (const [index, item] of images.entries()) {
++      const ref = refs[index]
++      if (ref === undefined) continue
++      void this.describe_image(item, date, message.delivery_id, ref.id)
++    }
++  }
++
++  /** 让视觉模型给一张图写一句描述并回填；全程 best-effort。 */
++  private async describe_image(
++    media: NormalizedMedia,
++    date: string,
++    entry_id: string,
++    attachment_id: string,
++  ): Promise<void> {
++    if (this.timeline === undefined || media.data === undefined) return
++    try {
++      // 图片描述也走同一个闸门与同一个引擎（本地 Gemma 需等显存；云端则直接调）。
++      const text = await this.gemma.run('image-describe', () => this.memory.describe_image({
++        data: media.data as Uint8Array,
++        media_type: media.mime_type ?? 'image/jpeg',
++      }))
++      if (text.trim() === '') return
++      this.timeline.update_attachment_description(date, entry_id, attachment_id, text.trim())
++    } catch (error) {
++      probe('timeline', 'media.describe_failed', { attachment_id, error: String(error) })
++    }
++  }
++
++  /** 写一条长期记忆；失败只留痕，绝不影响消息收发。 */
++  private record_timeline(entry: TimelineEntry): void {
++    if (this.timeline === undefined) return
++    try {
++      this.timeline.append(entry)
++    } catch (error) {
++      probe('timeline', 'append.failed', { id: entry.id, error: String(error) })
++    }
++  }
++
++  /**
++   * 启动时间线摘要调度（低频、纯本地）。
++   *
++   * 刻意与 iLink 轮询解耦：这里只读本地文件，不发任何微信请求；
++   * 触发条件是"某日已空闲 ≥3 小时"，所以 5 分钟看一次足够，也不会给微信链路添压力。
++   */
++  private start_timeline_scheduler_if_enabled(): void {
++    if (this.timeline === undefined) return
++    // 三条后台链路（摘要 / 图谱 / 图片描述）共用**同一个闸门**：
++    // 用本地 Gemma 时只有一份显存，并发只会互相拖慢、还可能重复冷启动。
++    // 用云端模型时不占显存，闸门也不再等显存（但保留并发上限，避免把额度打爆）。
++    const summarize = create_gemma_summarizer({
++      complete: (prompt, max_tokens) => this.memory.complete(prompt, max_tokens),
++    })
++    this.timeline_scheduler = start_timeline_scheduler({
++      store: this.timeline,
++      summarizer: request => this.gemma.run('timeline-summary', () => summarize(request)),
++      on_update: dates => probe('timeline', 'summary.updated_days', { dates }),
++    })
++    // 知识图谱：同一个"空闲 N 小时"触发，读时间线做增量更新。
++    this.graph_scheduler = start_graph_scheduler({
++      graph: this.graph,
++      timeline: this.timeline,
++      complete: prompt => this.gemma.run('graph-extract', () => this.memory.complete(prompt)),
++      on_update: result => probe('graph', 'updated', { ...result }),
++    })
++  }
++
++  /**
++   * 确保本地 Gemma 服务在跑（运行期按需补拉）。
++   *
++   * 启动时如果显存被占用，启动器会跳过拉起；等显存空出来之后由这里补拉，
++   * 路径/端口都从启动器注入的环境变量读取（**不在这里重新猜路径**，避免两处不一致）。
++   */
++  private async ensure_gemma_running(): Promise<void> {
++    if (await port_open(Number(process.env.GEMMA_SERVER_PORT ?? '8080'))) return
++    const binary = process.env.GEMMA_SERVER_BIN
++    const model = process.env.GEMMA_MODEL_PATH
++    if (binary === undefined || model === undefined) {
++      throw new Error('不知道 Gemma 怎么启动（缺 GEMMA_SERVER_BIN/GEMMA_MODEL_PATH），请重启一次链路。')
++    }
++    const args = [
++      '-m', model, '--host', '127.0.0.1', '--port', process.env.GEMMA_SERVER_PORT ?? '8080',
++      '-c', process.env.GEMMA_CONTEXT ?? '32768', '-ngl', '99', '--jinja', '--reasoning', 'off',
++      '-np', '1', '-fa', 'on', '--alias', process.env.DSH_GEMMA_MODEL ?? 'gemma-4-E4B-it-Q4_K_M',
++      '--sleep-idle-seconds', process.env.DSH_GEMMA_SLEEP_IDLE_SECONDS ?? '120',
++    ]
++    if (process.env.GEMMA_MMPROJ_PATH !== undefined && process.env.GEMMA_MMPROJ_PATH !== '') {
++      args.push('--mmproj', process.env.GEMMA_MMPROJ_PATH)
++    }
++    probe('gemma', 'server.start_on_demand', { binary, model })
++    const child = spawn(binary, args, { windowsHide: true, stdio: 'ignore', detached: true })
++    child.unref()
++    // 等它就绪（冷启动读 5GB 权重，给足时间）
++    for (let attempt = 0; attempt < 120; attempt += 1) {
++      if (await port_open(Number(process.env.GEMMA_SERVER_PORT ?? '8080'))) return
++      await new Promise(resolve => setTimeout(resolve, 2_000))
++    }
++    throw new Error('Gemma 服务启动后一直没就绪')
++  }
++
++  /** 轮询主循环：批次完成后才提交 cursor；错误按类别处理。 */
++  private async poll_loop(): Promise<void> {
++    let backoff_index = 0
++    /** 游标连续被卡住的次数；用于退避，避免服务端立刻重投造成热循环。 */
++    let cursor_stall = 0
++    while (!this.controller.signal.aborted && !this.stopped) {
++      // 队列里有待发送的，顺手泵一次（不依赖新消息触发）。
++      void this.outbound.drain()
++      const cursor = this.store.get_cursor()
++      const result = await this.ingress.poll(cursor, this.controller.signal)
++
++      switch (result.kind) {
++        case 'messages': {
++          backoff_index = 0
++          const committable = await this.inbound.handle_batch(result.messages, result.cursor)
++          if (committable && result.cursor !== undefined) {
++            this.store.set_cursor(result.cursor)
++            cursor_stall = 0
++          } else if (!committable) {
++            probe('inbound', 'cursor.held', {
++              reason: '有 delivery 未达终态，等待重投或恢复',
++              delivery_ids: result.messages.map(m => m.delivery_id),
++              stall: cursor_stall + 1,
++            })
++            // 游标被卡住时服务端会立刻重投同一条消息；不加退避就是热循环
++            // （实测一次挂载失败能打出上千条重复事件）。
++            cursor_stall += 1
++            await sleep(Math.min(5_000, 500 * cursor_stall), this.controller.signal)
++          }
++          await this.outbound.drain()
++          break
++        }
++        case 'idle': {
++          backoff_index = 0
++          if (result.cursor !== undefined) this.store.set_cursor(result.cursor)
++          await this.outbound.drain()
++          break
++        }
++        case 'session_timeout': {
++          // 临时会话超时：重新通知一次并继续用原 cursor（设计文档 §10.2）。
++          probe('ingress', 'session_timeout.recover')
++          await this.ingress.notify_start(this.controller.signal).catch(error => {
++            probe('ingress', 'session_timeout.notify_failed', { error: String(error) })
++          })
++          break
++        }
++        case 'auth_required': {
++          // 认证失效：停止消费，写标记，等人工扫码（不无限重试）。
++          probe('lifecycle', 'auth_required', { detail: result.detail })
++          this.write_auth_marker(result.detail)
++          this.stopped = true
++          return
++        }
++        case 'protocol_error': {
++          const wait = BACKOFF_STEPS[Math.min(backoff_index, BACKOFF_STEPS.length - 1)]!
++          backoff_index += 1
++          probe('ingress', 'backoff', { wait_ms: wait, attempt: backoff_index, detail: result.detail })
++          await sleep(wait, this.controller.signal)
++          break
++        }
++      }
++    }
++  }
++
++  /** 写认证失效标记，供启动器提示扫码。 */
++  private write_auth_marker(detail: string): void {
++    const marker = process.env.DSH_WEIXIN_TOKEN_MARKER
++      ?? join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh'), 'weixin-token-invalid.flag')
++    void import('node:fs/promises')
++      .then(fs => fs.writeFile(marker, `${new Date().toISOString()} ${detail}\n`, 'utf8'))
++      .catch(() => undefined)
++    console.error('[webhook-weixin] 认证失效，已停止消费；请运行 weixin_login.py 重新扫码。标记：' + marker)
++  }
++
++  /** 桥接 assistant-stream：聚合成正文、按 turn 绑定上下文、驱动进度/心跳。 */
++  private bind_agent_stream(agent: Agent): void {
++    const session_id = String(agent.id)
++    if (this.stream_disposers.has(session_id)) return
++    // 长期记忆的读取工具装在**这个 agent 自己**的 ctx 上（用 agent.ctx.effect 保证随 agent 卸载清理）。
++    // 只装"读"：写入由链路自动完成，不开放给模型，避免它把臆想的事实写进长期记忆。
++    if (this.timeline !== undefined) {
++      agent.ctx.effect(() => {
++        register_timeline_tools(agent.ctx, this.timeline as TimelineStore)
++        register_graph_tools(agent.ctx, this.graph)
++        register_notify_tools(agent.ctx, this.notify)
++        register_bridge_result_tools(agent.ctx, this.store)
++    // codex / opencode 的会话清单与聊天记录（便于远程指挥那些会话）
++    register_bridge_session_tools(agent.ctx)
++        return () => { /* 工具注册随 effect 作用域自动释放 */ }
++      }, 'webhook-weixin.memory-tools()')
++    }
++    // 只处理文本分片。**turn 生命周期不在这里**：
++    // `agent/assistant-stream` 的 start/end 表示"一次模型请求 attempt"（含 turn/step），
++    // 一个真实任务包含多 step、多 attempt；在 attempt 上做 begin/end turn 会把一个长任务
++    // 拆成一堆"伪 turn"，并让同一 turn 的回复上下文被后续消息反复覆盖（已由日志证实）。
++    const dispose = agent.ctx.on('agent/assistant-stream', ({ agent: subject, frame }: { agent: Agent; frame: AssistantStreamFrame }) => {
++      if (subject !== agent) return
++      if (frame.type === 'chunk') this.handle_chunk(session_id, frame)
++    })
++
++    // 真正的 turn 边界：pre-step（step===1 或 turn 变化 = 新 turn）与 turn-stopping（turn 结束）。
++    const dispose_pre_step = agent.ctx.on(
++      'agent/pre-step',
++      ({ agent: subject, turn, step }: { agent: Agent; turn: number; step: number }, next: () => Promise<unknown>) => {
++        if (subject === agent && (step === 1 || this.current_turn.get(session_id) !== turn)) {
++          this.begin_turn_once(session_id, turn)
++        }
++        return next() as never
++      },
++    )
++    const dispose_turn_stopping = agent.ctx.on(
++      'agent/turn-stopping',
++      ({ agent: subject, turn }: { agent: Agent; turn: number }) => {
++        if (subject !== agent) return
++        void this.handle_turn_end(session_id, turn)
++      },
++    )
++    const dispose_error = agent.ctx.on('agent/error', ({ error }: { error: unknown }) => {
++      const detail = error instanceof Error ? error.message : String(error)
++      probe('inbound', 'agent.error', { session_id, error: detail })
++      console.error(`[webhook-weixin] agent error session=${session_id}: ${detail}`)
++      this.turn_error.set(session_id, detail)
++      this.arm_turn_failure(session_id, detail)
++      // 额度/鉴权/模型下线这类"重试也没用"的错误 → 自动换一个 API 再来
++      const reason = classify_llm_failure(detail)
++      if (reason !== undefined) void this.failover_model(session_id, detail, reason)
++    })
++    this.stream_disposers.set(session_id, () => {
++      dispose()
++      dispose_error()
++      dispose_pre_step()
++      dispose_turn_stopping()
++    })
++    probe('lifecycle', 'stream.bound', { session_id })
++  }
++
++  /**
++   * 一轮开始：**只在首次进入该 turn 时**绑定回复上下文并启动进度追踪。
++   *
++   * 关键约束（修复"同一 turn 上下文被后续消息覆盖"）：
++   * 已经绑定过的 turn 绝不重绑——长任务期间用户再发消息时，
++   * 那条新消息属于下一个 turn，不能改写本轮回复该用的 context_token。
++   */
++  private begin_turn_once(session_id: string, turn: number): void {
++    const already = this.turn_context.get(session_id, turn)
++    this.current_turn.set(session_id, turn)
++    this.aggregators.set(session_id, new ReplyAggregator())
++    this.tool_calls_seen.set(session_id, new Set())
++    this.outbound.begin_turn(session_id, turn)
++    if (already !== undefined && this.binding_is_fresh(already.delivery_id)) {
++      probe('outbound', 'turn.start_reuse', { session_id, turn, delivery_id: already.delivery_id })
++      return
++    }
++    if (already !== undefined) {
++      // 重启后 turn 号会重复（历史 turn_context 仍在库里）。
++      // 旧绑定的 context_token 很可能已过期，复用它会让回复发不出去——这里强制重绑当前 delivery。
++      probe('outbound', 'turn.rebind_stale', { session_id, turn, delivery_id: already.delivery_id })
++    }
++    // delivery → session 映射由入站协调器写入；取最近一条注入的 delivery 作为本轮上下文。
++    // 用 bind_if_absent 而非 bind：同一 turn 的绑定一旦建立就不可被后续消息覆盖。
++    const latest = this.store.latest_delivery_for_session(session_id)
++    if (latest !== undefined) {
++      const delivery = this.store.get_delivery(latest.delivery_id)
++      const context_token = this.store.delivery_context_token(latest.delivery_id)
++      this.turn_context.bind_if_absent(session_id, turn, {
++        delivery_id: latest.delivery_id,
++        user_id: delivery?.user_id ?? latest.user_id,
++        ...context_token === undefined ? {} : { context_token },
++      })
++    }
++    const context = this.turn_context.resolve(session_id, turn)
++    probe('outbound', 'turn.start', {
++      session_id, turn, delivery_id: context?.delivery_id, has_token: context?.context_token !== undefined,
++    })
++  }
++
++  /**
++   * 该 turn 绑定是否仍然新鲜。
++   * 超过 TTL 就视为"重启前的旧绑定"：turn 号会重复，但 context_token 可能已失效。
++   */
++  private binding_is_fresh(delivery_id: string): boolean {
++    const record = this.store.get_delivery(delivery_id)
++    if (record === undefined) return false
++    return Date.now() - record.received_at < BINDING_TTL_MS
++  }
++
++  /**
++   * 自动换模型：把失活的 API 拉黑，切到下一个可用的，并把用户刚才那条消息重做一遍。
++   *
++   * 全过程不重启、不丢上下文（`sessionController.selectModel` 装到下一个请求上），
++   * 并同步写回 `modelConfig.json` 的默认模型——否则控制台显示的、以及下次启动器同步出去的
++   * 还是那个已经挂掉的模型，等于白换。
++   */
++  private async failover_model(session_id: string, detail: string, reason: FailoverReason): Promise<void> {
++    try {
++      const config_path = find_model_config(PROJECT_CONFIG_DIR)
++      if (config_path === undefined) {
++        probe('failover', 'config_missing', { workspace: PROJECT_CONFIG_DIR })
++        return
++      }
++      const config = read_json_file(config_path)
++      const failover = parse_failover_config(config)
++      if (!failover.enabled) return
++
++      const current = this.current_model
++      const dead = this.model_health.mark_dead(current, reason, detail, cooldown_ms(reason, failover))
++      probe('failover', 'model.dead', {
++        provider: current.provider, model: current.model, reason, until: dead.until, detail: detail.slice(0, 120),
++      })
++
++      const next = next_alive_candidate(failover.order, current, candidate => this.model_health.is_dead(candidate))
++      if (next === undefined) {
++        probe('failover', 'no_candidate', { tried: current })
++        const user_id = this.store.latest_user_id()
++        if (user_id !== undefined) {
++          const session_key = this.store.get_session_id(user_id) ?? session_id
++          this.outbound.enqueue_notice({
++            session_id: session_key, user_id, kind: 'assistant',
++            text: `配置里的模型接口都不可用了（${current.model}：${detail.slice(0, 80)}）。`
++              + '换个 key 或等额度恢复后我再试；也可以让我用别的模型。',
++          })
++          void this.outbound.drain()
++        }
++        return
++      }
++
++      // ① 装到当前会话的下一个请求上（不丢上下文）
++      const controller = (this.ctx as unknown as {
++        get(name: string): { selectModel?: (request: { sessionId: string, provider: string, model: string }) => Promise<unknown> } | undefined
++      }).get('sessionController')
++      if (controller?.selectModel === undefined) {
++        probe('failover', 'controller_missing', {})
++        return
++      }
++      await controller.selectModel({
++        sessionId: brandString<SessionId>(session_id),
++        provider: next.provider,
++        model: next.model,
++      })
++      this.current_model = { provider: next.provider, model: next.model }
++
++      // ② 写回默认模型（控制台显示 + 下次启动器同步都跟着变）
++      this.persist_default_model(config_path, config, next)
++
++      probe('failover', 'model.switched', {
++        from: `${current.provider}/${current.model}`, to: `${next.provider}/${next.model}`, reason,
++      })
++
++      // ③ 告诉用户，并把刚才那条消息重做一遍
++      const user_id = this.store.latest_user_id()
++      if (user_id !== undefined) {
++        const session_key = this.store.get_session_id(user_id) ?? session_id
++        this.outbound.enqueue_notice({
++          session_id: session_key, user_id, kind: 'assistant',
++          text: `「${current.model}」这个接口用不了了（${reason === 'quota' ? '额度用完' : reason === 'auth' ? 'key 失效' : '模型下线'}），`
++            + `我先换成「${next.model}」，把你刚才那条重做一遍。`,
++        })
++        void this.outbound.drain()
++        await this.retry_last_message(session_id, user_id)
++      }
++    } catch (error) {
++      probe('failover', 'failed', { error: String(error).slice(0, 200) })
++    }
++  }
++
++  /** 把新的默认模型写回 modelConfig.json（含备份）。 */
++  private persist_default_model(
++    config_path: string,
++    config: { defaultModel?: unknown },
++    next: ModelCandidate,
++  ): void {
++    try {
++      const parsed = config as { defaultModel?: unknown, updatedAt?: string }
++      parsed.defaultModel = { provider: next.provider, model: next.model }
++      parsed.updatedAt = new Date().toISOString()
++      copyFileSync(config_path, `${config_path}.bak-failover`)
++      writeFileSync(config_path, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8')
++    } catch (error) {
++      probe('failover', 'persist_failed', { error: String(error).slice(0, 160) })
++    }
++  }
++
++  /** 记住最近一条用户消息（换模型后要重做它）。 */
++  private remember_user_message(session_id: string, user_id: string, text: string): void {
++    this.last_user_message.set(session_id, { user_id, text, at: Date.now(), retried: false })
++  }
++
++  /**
++   * 重做最近一条用户消息（每个会话只自动重做一次，避免连环重试）。
++   *
++   * 走的是**真实入站管线**（和用户自己发一样），所以工具、记忆、回复都一样；
++   * 只是 delivery id 用 `retry-` 前缀，便于在探针里区分。
++   */
++  private async retry_last_message(session_id: string, user_id: string): Promise<void> {
++    const remembered = this.last_user_message.get(session_id)
++    if (remembered === undefined || remembered.text.trim() === '') return
++    if (remembered.retried) {
++      probe('failover', 'retry.skipped_already', { session_id })
++      return
++    }
++    remembered.retried = true
++    const delivery_id = `retry-${Date.now()}-${randomBytes(3).toString('hex')}`
++    probe('failover', 'retry.start', { session_id, delivery_id, chars: remembered.text.length })
++    try {
++      await this.inbound.handle_batch([{
++        delivery_id, user_id, text: remembered.text, media: [], received_at: Date.now(),
++      }], undefined)
++    } catch (error) {
++      probe('failover', 'retry.failed', { session_id, error: String(error).slice(0, 160) })
++    }
++  }
++
++  /**
++   * 记一次 agent 错误，并在宽限期后把这一轮按失败收尾。
++   *
++   * 为什么必须做：模型接口持续报错（例如 429「api key 日限额已用完」）时，agent loop
++   * 会一直重试/卡住，`agent/turn-stopping` 永远不来——用户那边只看到每 5 分钟一条
++   * "还在处理中"，永远等不到结果（2026-09-21 23:46 那轮实测卡了 10 分钟以上）。
++   * 宽限期内只要有任何新分片就取消收尾（说明重试成功了，别抢话）。
++   */
++  private arm_turn_failure(session_id: string, detail: string): void {
++    const existing = this.turn_failure_timers.get(session_id)
++    if (existing !== undefined) clearTimeout(existing)
++    const timer = setTimeout(() => {
++      this.turn_failure_timers.delete(session_id)
++      void this.fail_turn(session_id, detail)
++    }, AGENT_ERROR_GRACE_MS)
++    this.turn_failure_timers.set(session_id, timer)
++  }
++
++  /** 有活动就取消待定的失败收尾。 */
++  private clear_turn_failure(session_id: string): void {
++    const timer = this.turn_failure_timers.get(session_id)
++    if (timer !== undefined) {
++      clearTimeout(timer)
++      this.turn_failure_timers.delete(session_id)
++    }
++  }
++
++  /**
++   * 把卡住的一轮按失败收尾：**如实说明原因**，并把这一轮关掉。
++   *
++   * 宁可说"没做成 + 为什么"，也不要让用户对着"还在处理中"干等——
++   * 这也是人格里"工具失败就直接说失败和可确认的原因"的要求。
++   */
++  private async fail_turn(session_id: string, detail: string): Promise<void> {
++    const turn = this.current_turn.get(session_id)
++    if (turn === undefined) return
++    const user_id = this.turn_context.resolve(session_id, turn)?.user_id ?? ''
++    probe('inbound', 'turn.failed', { session_id, turn, detail })
++    // 已经在这里说明过了：清掉错误标记，免得 handle_turn_end 再补一条重复的
++    this.turn_error.delete(session_id)
++    this.outbound.enqueue_assistant({
++      session_id, user_id, turn,
++      text: `我这轮没做成：模型接口报错「${detail.slice(0, 140)}」。\n`
++        + '多半是额度/限额用完或 key 失效——换个模型（控制台「模型选择」）或等额度恢复后，再让我做一次。',
++    })
++    await this.handle_turn_end(session_id, turn)
++  }
++
++  /** 一轮结束：补发尾段、清理状态。 */
++  private async handle_turn_end(session_id: string, turn: number): Promise<void> {
++    this.clear_turn_failure(session_id)
++    // 整轮报过错、又一个字都没发出去 → 必须说一句，不能让用户对着空气等
++    // （实测：中转站上游过载时 harness 会以 error 结束这一轮，若这里不补，用户什么都收不到）
++    const error = this.turn_error.get(session_id)
++    const visible = this.turn_visible.has(session_id)
++    this.turn_error.delete(session_id)
++    this.turn_visible.delete(session_id)
++    if (error !== undefined && !visible) {
++      probe('outbound', 'turn.failed_notice', { session_id, turn })
++      this.outbound.enqueue_notice({
++        session_id,
++        user_id: this.turn_context.resolve(session_id, turn)?.user_id ?? '',
++        kind: 'assistant',
++        text: `我这轮没做成：模型接口报错「${error.slice(0, 120)}」。要我再试一次吗？`,
++      })
++    }
++    const aggregator = this.aggregators.get(session_id)
++    this.aggregators.delete(session_id)
++    if (aggregator !== undefined) {
++      const tail = aggregator.finish()
++      if (tail) {
++        this.outbound.enqueue_assistant({
++          session_id, user_id: this.turn_context.resolve(session_id, turn)?.user_id ?? '', turn, text: tail,
++        })
++      }
++    }
++    this.outbound.end_turn(session_id)
++    this.tool_calls_seen.delete(session_id)
++    this.current_turn.delete(session_id)
++    this.last_progress_at.delete(session_id)
++    this.turn_context.prune(session_id)
++    await this.outbound.drain()
++    probe('outbound', 'turn.done', { session_id, turn })
++  }
++
++  /** 处理流分片：正文聚合发送、思考摘要作为进度（即心跳）。 */
++  private handle_chunk(session_id: string, frame: AssistantStreamFrame): void {
++    // 只有 type='chunk' 的帧带 chunk 载荷；调用方已按帧类型分流，这里再做一次类型收窄。
++    if (frame.type !== 'chunk') return
++    // 有输出就说明上一轮报错后恢复了（重试成功），撤掉待定的失败收尾
++    this.clear_turn_failure(session_id)
++    const chunk = frame.chunk as { type?: string; text?: string; name?: string; id?: string } | undefined
++    if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
++      const aggregator = this.aggregators.get(session_id) ?? new ReplyAggregator()
++      this.aggregators.set(session_id, aggregator)
++      const turn = this.current_turn.get(session_id) ?? 0
++      for (const segment of aggregator.accept_chunk(chunk.text)) {
++        this.outbound.note_visible(session_id)
++        this.turn_visible.add(session_id)          // 本轮确实有正文发出
++        this.outbound.enqueue_assistant({ session_id, user_id: '', turn, text: segment })
++      }
++      this.outbound.note_visible(session_id)
++      void this.outbound.drain()
++      return
++    }
++    if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') {
++      const aggregator = this.aggregators.get(session_id) ?? new ReplyAggregator()
++      this.aggregators.set(session_id, aggregator)
++      aggregator.accept_reasoning(chunk.text)
++      // 进度推送：按时间驱动，而不是"每 N 次工具调用"。
++      // 摘要本身就是心跳，所以推送后 note_visible 会把空闲阈值推后，抑制额外心跳。
++      this.maybe_push_progress(session_id, aggregator)
++      return
++    }
++    if (chunk?.type === 'tool-call-delta' && typeof chunk.name === 'string' && chunk.name.length > 0) {
++      const seen = this.tool_calls_seen.get(session_id) ?? new Set<string>()
++      const call_id = typeof chunk.id === 'string' && chunk.id.length > 0 ? chunk.id : `${chunk.name}:${seen.size}`
++      if (seen.has(call_id)) return
++      seen.add(call_id)
++      this.tool_calls_seen.set(session_id, seen)
++    }
++  }
++
++  /**
++   * 按时间推送思考摘要（即进度，也是心跳）。
++   *
++   * 触发条件：距上次推送 ≥ PROGRESS_MIN_INTERVAL_MS，且有足够长度的新摘要。
++   * 不再依赖工具调用次数——否则"只调一次工具"的任务全程无进度。
++   */
++  private maybe_push_progress(session_id: string, aggregator: ReplyAggregator): void {
++    if (PROGRESS_MIN_INTERVAL_MS <= 0) return
++    const now = Date.now()
++    const last = this.last_progress_at.get(session_id) ?? 0
++    if (now - last < PROGRESS_MIN_INTERVAL_MS) return
++    const excerpt = aggregator.take_reasoning_excerpt(120)
++    if (excerpt === undefined || excerpt.length < PROGRESS_MIN_CHARS) return
++    // 只推**中文**思考摘要：模型（尤其换模型后）的思维链常是英文，
++    // 直接推过去等于把"隐藏推理"摊给用户看（实测推过 "（进度·欣爱在想）user wants me"），
++    // 人格里明确禁止。中文占比不够就当没有进度，宁可安静。
++    const cjk = (excerpt.match(/[\u4e00-\u9fff]/g) ?? []).length
++    if (cjk < PROGRESS_MIN_CHARS) return
++    this.last_progress_at.set(session_id, now)
++    this.outbound.enqueue_progress(session_id, `（进度·欣爱在想）${excerpt}`)
++    probe('outbound', 'progress.pushed', { session_id, chars: excerpt.length })
++    void this.outbound.drain()
++  }
++
++  /** 停止：幂等；释放监听、租约与 Agent。 */
++  async stop(): Promise<void> {
++    if (this.stopped && this.running === undefined) return
++    this.stopped = true
+     this.controller.abort()
+     await this.running?.catch(() => undefined)
++    this.codex_watcher.stop()
++    this.opencode_watcher.stop()
++    this.outbound.stop()
++    if (this.inject_server !== undefined) {
++      this.inject_server.close()
++      this.inject_server = undefined
++    }
++    this.timeline_scheduler?.stop()
++    this.timeline_scheduler = undefined
++    // 视图是惰性重建的，停止前把待写的一次性刷出来（否则 .md 可能落后于记录）
++    try {
++      this.timeline?.flush_views()
++    } catch (error) {
++      probe('timeline', 'flush.failed', { error: String(error) })
++    }
++    this.graph_scheduler?.stop()
++    this.graph_scheduler = undefined
++    for (const dispose of this.stream_disposers.values()) dispose()
++    this.stream_disposers.clear()
++    this.aggregators.clear()
++    this.tool_calls_seen.clear()
++    // 尽力把队列里剩下的发出去，再释放所有权。
++    await this.outbound.drain().catch(() => undefined)
+     await this.host.dispose_agents()
++    this.lease.release()
++    this.store.close()
++    probe('lifecycle', 'connector.stopped')
+   }
+ }
+ 
+-/** 将连接器绑定到 Cordis effect，卸载时自动停止并排空 Agent。 */
++/** 可被 signal 打断的等待。 */
++function sleep(ms: number, signal?: AbortSignal): Promise<void> {
++  return new Promise(resolve => {
++    const timer = setTimeout(done, ms)
++    function done(): void {
++      clearTimeout(timer)
++      signal?.removeEventListener('abort', done)
++      resolve()
++    }
++    signal?.addEventListener('abort', done, { once: true })
++  })
++}
++
++/**
++ * 将连接器绑定到 Cordis effect；卸载时幂等地停止。
++ *
++ * 关键：`start()` 必须被 **await**，让 lease 冲突 / OpenClaw 隔离失败 / Agent 能力缺失 /
++ * 微信启动失败都变成插件装配失败（fail closed）。否则会退化成"Web 后台正常、微信消费者
++ * 其实没起来"的假成功——此时进程还活着，但用户发消息永远没人接。
++ */
+ export function install_weixin_connector(ctx: Context, options: WeixinConnectorOptions): WeixinConnector {
+   const connector = new WeixinConnector(ctx, options)
+-  ctx.effect(() => {
+-    void connector.start_connector()
+-    return () => connector.stop_connector()
++  ctx.effect(async () => {
++    const done = probe_timer('lifecycle', 'connector.start')
++    try {
++      await connector.start()
++      done({ outcome: 'ok' })
++    } catch (error) {
++      probe('lifecycle', 'connector.start_failed', {
++        error: error instanceof Error ? error.message : String(error),
++      })
++      console.error('[webhook-weixin] 连接器启动失败：'
++        + (error instanceof Error ? error.stack ?? error.message : String(error)))
++      // 如实向上抛：让宿主判定插件装配失败，而不是记一条日志后继续跑。
++      throw error
++    }
++    return () => connector.stop()
+   }, 'webhook-weixin.lifecycle()')
+   return connector
+ }
+diff --git a/packages/webhook/webhook-weixin/src/session/harnessAgentHost.ts b/packages/webhook/webhook-weixin/src/session/harnessAgentHost.ts
+deleted file mode 100644
+index fc73f29..0000000
+--- a/packages/webhook/webhook-weixin/src/session/harnessAgentHost.ts
++++ /dev/null
+@@ -1,59 +0,0 @@
+-/** Harness Agent Host：把微信适配器的创建、查找和恢复委托给 ctx.agents 原生服务。 */
+-
+-import type { Context } from '@deepseek-ai/cordis'
+-import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
+-import type { SessionId } from '@deepseek-ai/dsh-session'
+-import type { SessionAgentHost } from './weixinSessionAdapter.ts'
+-
+-/** 用于创建微信根 Agent 的 Harness 配置。 */
+-export interface HarnessAgentHostOptions {
+-  workspace_path: string
+-  provider: string
+-  model: string
+-  reasoning_effort?: AgentOptions['reasoningEffort']
+-}
+-
+-/** 真实 ctx.agents 实现的生命周期适配器。 */
+-export class HarnessAgentHost implements SessionAgentHost {
+-  private readonly handles = new Map<string, AgentHandle>()
+-
+-  /** 创建 Host 并绑定 Harness Context 和模型路由。 */
+-  constructor(private readonly ctx: Context, private readonly options: HarnessAgentHostOptions) {}
+-
+-  /** 查找当前进程在线 Agent。 */
+-  get_agent(session_id: SessionId): Agent | undefined { return this.ctx.agents.get(session_id) }
+-
+-  /** 为新的微信用户创建 Harness 根 Agent。 */
+-  async create_agent(session_id: SessionId): Promise<Agent> {
+-    const handle = await this.ctx.agents.create({
+-      sessionId: session_id,
+-      meta: { cwd: this.options.workspace_path },
+-      agentOptions: this.agent_options(),
+-    })
+-    this.handles.set(String(session_id), handle)
+-    return handle.agent
+-  }
+-
+-  /** 从持久化 Session 恢复 Harness Agent。 */
+-  async resume_agent(session_id: SessionId): Promise<Agent> {
+-    const handle = await this.ctx.agents.resume({ resumeSessionId: session_id, agentOptions: this.agent_options() })
+-    this.handles.set(String(session_id), handle)
+-    return handle.agent
+-  }
+-
+-  /** 在 Cordis 插件卸载时销毁本 Host 创建的 Agent。 */
+-  async dispose_agents(): Promise<void> {
+-    const handles = [...this.handles.values()]
+-    this.handles.clear()
+-    await Promise.all(handles.map(handle => handle.dispose()))
+-  }
+-
+-  /** 构造 Harness Agent 的模型配置。 */
+-  private agent_options(): AgentOptions {
+-    return {
+-      provider: this.options.provider,
+-      model: this.options.model,
+-      ...this.options.reasoning_effort === undefined ? {} : { reasoningEffort: this.options.reasoning_effort },
+-    }
+-  }
+-}
+diff --git a/packages/webhook/webhook-weixin/src/session/sessionRouteStore.ts b/packages/webhook/webhook-weixin/src/session/sessionRouteStore.ts
+deleted file mode 100644
+index 26128a4..0000000
+--- a/packages/webhook/webhook-weixin/src/session/sessionRouteStore.ts
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/** 微信用户会话路由存储：持久化 user_id、SessionId、游标和去重记录，不保存 Token。 */
+-
+-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+-import { dirname } from 'node:path'
+-
+-interface RouteState {
+-  sessions: Record<string, string>
+-  cursor: string
+-  deliveries: string[]
+-}
+-
+-/** 一个 JSON 文件实现的小型持久路由表；后续可替换为 Harness storage provider。 */
+-export class SessionRouteStore {
+-  private state: RouteState = { sessions: {}, cursor: '', deliveries: [] }
+-  private loaded = false
+-  private write_chain: Promise<void> = Promise.resolve()
+-
+-  /** 使用文件路径创建路由存储。 */
+-  constructor(private readonly file_path: string) {}
+-
+-  /** 加载已有路由、游标和有限去重窗口。 */
+-  async load_state(): Promise<void> {
+-    if (this.loaded) return
+-    try {
+-      const raw = await readFile(this.file_path, 'utf8')
+-      const parsed = JSON.parse(raw) as Partial<RouteState>
+-      this.state = {
+-        sessions: parsed.sessions ?? {},
+-        cursor: parsed.cursor ?? '',
+-        deliveries: (parsed.deliveries ?? []).slice(-2048),
+-      }
+-    } catch (error: unknown) {
+-      if ((error as { code?: string }).code !== 'ENOENT') throw error
+-    }
+-    this.loaded = true
+-  }
+-
+-  /** 获取微信用户对应的 Harness SessionId。 */
+-  get_session_id(user_id: string): string | undefined { return this.state.sessions[user_id] }
+-
+-  /** 记录微信用户对应的 Harness SessionId。 */
+-  async set_session_id(user_id: string, session_id: string): Promise<void> {
+-    this.state.sessions[user_id] = session_id
+-    await this.persist_state()
+-  }
+-
+-  /** 判断 delivery 是否已经处理；首次出现时返回 true 并记录。 */
+-  async accept_delivery(delivery_id: string): Promise<boolean> {
+-    if (this.state.deliveries.includes(delivery_id)) return false
+-    this.state.deliveries.push(delivery_id)
+-    this.state.deliveries = this.state.deliveries.slice(-2048)
+-    await this.persist_state()
+-    return true
+-  }
+-
+-  /** 获取上次成功提交的 getUpdates 游标。 */
+-  get_cursor(): string { return this.state.cursor }
+-
+-  /** 持久化新的 getUpdates 游标。 */
+-  async set_cursor(cursor: string): Promise<void> { this.state.cursor = cursor; await this.persist_state() }
+-
+-  /** 原子写入路由状态，避免重启时产生半个 JSON 文件。 */
+-  private async persist_state(): Promise<void> {
+-    this.write_chain = this.write_chain.then(async () => {
+-      await mkdir(dirname(this.file_path), { recursive: true })
+-      const temporary = `${this.file_path}.tmp`
+-      await writeFile(temporary, JSON.stringify(this.state), 'utf8')
+-      await rename(temporary, this.file_path)
+-    })
+-    return this.write_chain
+-  }
+-}
+diff --git a/packages/webhook/webhook-weixin/src/session/weixinSessionAdapter.ts b/packages/webhook/webhook-weixin/src/session/weixinSessionAdapter.ts
+deleted file mode 100644
+index d7a050f..0000000
+--- a/packages/webhook/webhook-weixin/src/session/weixinSessionAdapter.ts
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/** Harness Session Adapter：把规范化微信消息路由到原生 Agent，负责复用、resume、串行化和隔离。 */
+-
+-import type { Agent } from '@deepseek-ai/dsh-agent'
+-import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+-import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+-import { brandString } from '@deepseek-ai/dsh-brand'
+-import type { SessionId } from '@deepseek-ai/dsh-session'
+-import type { NormalizedWeixinMessage } from '../message/messageNormalizer.ts'
+-import { SessionRouteStore } from './sessionRouteStore.ts'
+-
+-export interface WeixinAttachmentStore {
+-  saveImage(input: { data: Uint8Array; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; name?: string }): Promise<ImageAttachmentRef>
+-  saveFile?(input: { data: Uint8Array; name?: string }): Promise<FileAttachmentRef>
+-}
+-
+-export interface WeixinReplyContext {
+-  user_id: string
+-  context_token?: string
+-}
+-
+-export interface SessionAgentHost {
+-  get_agent(session_id: SessionId): Agent | undefined
+-  create_agent(session_id: SessionId): Promise<Agent>
+-  resume_agent(session_id: SessionId): Promise<Agent>
+-}
+-
+-/** 微信用户到 Harness Agent 的持久路由适配器。 */
+-export class WeixinSessionAdapter {
+-  private readonly queues = new Map<string, Promise<void>>()
+-  private readonly reply_contexts = new Map<string, WeixinReplyContext>()
+-
+-  /** 创建适配器并绑定路由存储和 Harness 原生 Agent Host。 */
+-  constructor(
+-    private readonly host: SessionAgentHost,
+-    private readonly routes: SessionRouteStore,
+-    private readonly attachments?: WeixinAttachmentStore,
+-  ) {}
+-
+-  /** 初始化持久路由状态。 */
+-  async load_state(): Promise<void> { await this.routes.load_state() }
+-
+-  /** 根据 Harness Agent id 查找微信回传所需的用户和上下文令牌。 */
+-  get_reply_context(session_id: string): WeixinReplyContext | undefined { return this.reply_contexts.get(session_id) }
+-
+-  /** 串行处理同一用户消息，确保 Session 历史顺序和回复顺序稳定。 */
+-  async handle_message(message: NormalizedWeixinMessage): Promise<void> {
+-    const previous = this.queues.get(message.user_id) ?? Promise.resolve()
+-    const current = previous.then(() => this.process_message(message))
+-    const queued = current.catch(() => undefined)
+-    this.queues.set(message.user_id, queued)
+-    try { await current } finally {
+-      if (this.queues.get(message.user_id) === queued) this.queues.delete(message.user_id)
+-    }
+-  }
+-
+-  /** 查找在线 Agent、恢复冷 Session 或创建新 Session 后投递 followup。 */
+-  private async process_message(message: NormalizedWeixinMessage): Promise<void> {
+-    if (!(await this.routes.accept_delivery(message.delivery_id))) return
+-    let session_id = this.routes.get_session_id(message.user_id)
+-    let agent: Agent | undefined
+-    if (session_id !== undefined) {
+-      const branded = brandString<SessionId>(session_id)
+-      agent = this.host.get_agent(branded)
+-      if (agent === undefined) agent = await this.host.resume_agent(branded)
+-    } else {
+-      session_id = `weixin-${message.user_id}`
+-      const branded = brandString<SessionId>(session_id)
+-      agent = await this.host.create_agent(branded)
+-      await this.routes.set_session_id(message.user_id, session_id)
+-    }
+-    const content: ContentBlock[] = []
+-    if (message.text.trim()) content.push({ type: 'text', text: message.text.trim() })
+-    for (const media of message.media) {
+-      if (media.data && media.kind === 'image' && this.attachments) {
+-        const media_type = media.mime_type === 'image/png' || media.mime_type === 'image/webp' || media.mime_type === 'image/gif' ? media.mime_type : 'image/jpeg'
+-        const attachment = await this.attachments.saveImage({ data: media.data, mediaType: media_type, ...media.name === undefined ? {} : { name: media.name } })
+-        content.push({ type: 'image', attachment })
+-      } else if (media.data && media.kind === 'file' && this.attachments?.saveFile) {
+-        const attachment = await this.attachments.saveFile({ data: media.data, ...media.name === undefined ? {} : { name: media.name } })
+-        content.push({ type: 'file', attachment })
+-      } else {
+-        const note = `[微信媒体 ${media.kind}${media.source_text ? `:${media.source_text}` : ''}]`
+-        content.push({ type: 'text', text: note })
+-      }
+-    }
+-    if (content.length === 0) content.push({ type: 'text', text: '[微信空消息]' })
+-    this.reply_contexts.set(String(agent.id), { user_id: message.user_id, ...message.context_token === undefined ? {} : { context_token: message.context_token } })
+-    agent.followup(createUserMessage({
+-      content,
+-      source: { kind: 'plugin', plugin: 'dsh-webhook-weixin', form: 'notice', summary: '微信消息' },
+-    }))
+-  }
+-}
+diff --git a/packages/webhook/webhook-weixin/tests/localReplay.spec.ts b/packages/webhook/webhook-weixin/tests/localReplay.spec.ts
+deleted file mode 100644
+index 32201c1..0000000
+--- a/packages/webhook/webhook-weixin/tests/localReplay.spec.ts
++++ /dev/null
+@@ -1,117 +0,0 @@
+-/** 微信本地回放测试：验证消息类型、会话生命周期、隔离、去重、串行和流式回复。 */
+-
+-import { mkdtemp, rm } from 'node:fs/promises'
+-import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
+-import { describe, expect, it } from 'vitest'
+-import type { Agent } from '@deepseek-ai/dsh-agent'
+-import { MessageNormalizer } from '../src/message/messageNormalizer.ts'
+-import { ReplyBufferRouter } from '../src/reply/replyBuffer.ts'
+-import { SessionRouteStore } from '../src/session/sessionRouteStore.ts'
+-import { WeixinSessionAdapter, type SessionAgentHost } from '../src/session/weixinSessionAdapter.ts'
+-
+-type FakeAgent = Agent & { followups: unknown[] }
+-
+-class ReplayHost implements SessionAgentHost {
+-  readonly agents = new Map<string, FakeAgent>()
+-  readonly creates: string[] = []
+-  readonly resumes: string[] = []
+-
+-  /** 查找本地回放中的在线 Agent。 */
+-  get_agent(session_id: string): Agent | undefined { return this.agents.get(session_id) }
+-
+-  /** 创建一个可记录 followup 的最小 Agent 替身。 */
+-  async create_agent(session_id: string): Promise<Agent> {
+-    const agent = this.make_agent(session_id)
+-    this.agents.set(session_id, agent)
+-    this.creates.push(session_id)
+-    return agent
+-  }
+-
+-  /** 从持久路由恢复一个可记录 followup 的最小 Agent 替身。 */
+-  async resume_agent(session_id: string): Promise<Agent> {
+-    const agent = this.make_agent(session_id)
+-    this.agents.set(session_id, agent)
+-    this.resumes.push(session_id)
+-    return agent
+-  }
+-
+-  /** 创建带有可观察入站消息列表的测试 Agent。 */
+-  private make_agent(session_id: string): FakeAgent {
+-    return { id: session_id, followups: [], followup(this: FakeAgent, message: unknown) { this.followups.push(message) } } as unknown as FakeAgent
+-  }
+-}
+-
+-describe('微信本地回放', () => {
+-  it('handles text, image, voice text priority and media fallback', async () => {
+-    const directory = await mkdtemp(join(tmpdir(), 'dsh-weixin-replay-'))
+-    try {
+-      const routes = new SessionRouteStore(join(directory, 'routes.json'))
+-      await routes.load_state()
+-      const host = new ReplayHost()
+-      const images: Uint8Array[] = []
+-      const adapter = new WeixinSessionAdapter(host, routes, {
+-        async saveImage(input) { images.push(input.data); return { type: 'image', attachmentId: `image-${images.length}` } as never },
+-      })
+-      const normalizer = new MessageNormalizer()
+-      const text = normalizer.normalize_message({ message_id: 1, from_user_id: 'user-a', context_token: 'ctx-a', item_list: [{ type: 1, text_item: { text: 'hello' } }] })
+-      await adapter.handle_message(text)
+-      const mixed = normalizer.normalize_message({ message_id: 2, from_user_id: 'user-a', item_list: [{ type: 1, text_item: { text: 'look' } }, { type: 2, image_item: { url: 'fixture' } }] })
+-      mixed.media[0]!.data = Uint8Array.from([1, 2, 3])
+-      await adapter.handle_message(mixed)
+-      const voice = normalizer.normalize_message({ message_id: 3, from_user_id: 'user-a', item_list: [{ type: 3, voice_item: { text: 'voice text' } }] })
+-      await adapter.handle_message(voice)
+-      const no_text = normalizer.normalize_message({ message_id: 4, from_user_id: 'user-a', item_list: [{ type: 3, voice_item: { playtime: 10, media: { full_url: 'fixture' } } }] })
+-      await normalizer.hydrate_media(no_text, async () => Uint8Array.from([83, 73, 76, 75]))
+-      await adapter.handle_message(no_text)
+-      const agent = host.agents.get('weixin-user-a')!
+-      expect(host.creates).toEqual(['weixin-user-a'])
+-      expect(agent.followups).toHaveLength(4)
+-      expect(images).toEqual([Uint8Array.from([1, 2, 3])])
+-      expect(JSON.stringify(agent.followups[0])).toContain('hello')
+-      expect(JSON.stringify(agent.followups[2])).toContain('voice text')
+-      expect(JSON.stringify(agent.followups[3])).toContain('voice_media_requires_asr')
+-    } finally {
+-      await rm(directory, { recursive: true, force: true })
+-    }
+-  })
+-
+-  it('keeps users isolated, serializes one user and resumes after restart', async () => {
+-    const directory = await mkdtemp(join(tmpdir(), 'dsh-weixin-replay-'))
+-    try {
+-      const file = join(directory, 'routes.json')
+-      const routes = new SessionRouteStore(file)
+-      await routes.load_state()
+-      const host = new ReplayHost()
+-      const adapter = new WeixinSessionAdapter(host, routes)
+-      const make = (id: number, user_id: string) => ({ delivery_id: `d-${id}`, user_id, text: `message-${id}`, media: [], received_at: id })
+-      await Promise.all([adapter.handle_message(make(1, 'a')), adapter.handle_message(make(2, 'a')), adapter.handle_message(make(3, 'b'))])
+-      expect(host.creates.sort()).toEqual(['weixin-a', 'weixin-b'])
+-      expect(host.agents.get('weixin-a')!.followups.map(item => JSON.stringify(item))).toHaveLength(2)
+-      const restartedHost = new ReplayHost()
+-      const restartedRoutes = new SessionRouteStore(file)
+-      await restartedRoutes.load_state()
+-      const restarted = new WeixinSessionAdapter(restartedHost, restartedRoutes)
+-      await restarted.handle_message(make(4, 'a'))
+-      expect(restartedHost.resumes).toEqual(['weixin-a'])
+-      expect(restartedHost.creates).toEqual([])
+-      await restarted.handle_message(make(4, 'a'))
+-      expect(restartedHost.resumes).toHaveLength(1)
+-    } finally {
+-      await rm(directory, { recursive: true, force: true })
+-    }
+-  })
+-
+-  it('commits one final reply from an ordered stream', async () => {
+-    const sent: string[] = []
+-    const router = new ReplyBufferRouter()
+-    const context = { user_id: 'user-a', send_text: async (_user: string, text: string) => { sent.push(text) } }
+-    await router.accept_frame('agent-a', { type: 'start' }, context)
+-    await router.accept_frame('agent-a', { type: 'chunk', chunk: { type: 'text-delta', text: 'first ' } }, context)
+-    await router.accept_frame('agent-a', { type: 'chunk', chunk: { type: 'text-delta', text: 'second' } }, context)
+-    await router.accept_frame('agent-a', { type: 'end', outcome: { kind: 'committed' } }, context)
+-    await router.accept_frame('agent-a', { type: 'end', outcome: { kind: 'committed' } }, context)
+-    expect(sent).toHaveLength(1)
+-    expect(sent[0]).toBe('first second')
+-  })
+-})
+diff --git a/packages/webhook/webhook-weixin/tests/replyBuffer.spec.ts b/packages/webhook/webhook-weixin/tests/replyBuffer.spec.ts
+deleted file mode 100644
+index aad796b..0000000
+--- a/packages/webhook/webhook-weixin/tests/replyBuffer.spec.ts
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/** 回复缓冲测试：验证流式文本顺序和最终提交只发生一次。 */
+-
+-import { describe, expect, it } from 'vitest'
+-import { ReplyBuffer, ReplyBufferRouter } from '../src/reply/replyBuffer.ts'
+-
+-describe('ReplyBuffer', () => {
+-  it('joins ordered string and text chunks', () => {
+-    const buffer = new ReplyBuffer()
+-    buffer.accept_chunk('你')
+-    buffer.accept_chunk({ text: '好' })
+-    expect(buffer.finish()).toBe('你好')
+-    expect(buffer.finish()).toBe('')
+-  })
+-
+-  it('ignores chunks after finalization', () => {
+-    const buffer = new ReplyBuffer()
+-    buffer.accept_chunk('a')
+-    expect(buffer.finish()).toBe('a')
+-    buffer.accept_chunk('b')
+-    expect(buffer.finish()).toBe('')
+-  })
+-})
+-
+-describe('ReplyBufferRouter', () => {
+-  it('sends one committed final text after ordered stream chunks', async () => {
+-    const sent: string[] = []
+-    const router = new ReplyBufferRouter()
+-    const sender = { user_id: 'u1', context_token: 'c1', send_text: async (_user: string, text: string) => { sent.push(text) } }
+-    await router.accept_frame('s1', { type: 'start' }, sender)
+-    await router.accept_frame('s1', { type: 'chunk', chunk: { type: 'text-delta', text: '你' } }, sender)
+-    await router.accept_frame('s1', { type: 'chunk', chunk: { type: 'text-delta', text: '好' } }, sender)
+-    await router.accept_frame('s1', { type: 'end', outcome: { kind: 'committed' } }, sender)
+-    await router.accept_frame('s1', { type: 'end', outcome: { kind: 'committed' } }, sender)
+-    expect(sent).toEqual(['你好'])
+-  })
+-})
+diff --git a/packages/webhook/webhook-weixin/tests/sessionRouteStore.spec.ts b/packages/webhook/webhook-weixin/tests/sessionRouteStore.spec.ts
+deleted file mode 100644
+index 76c1d5a..0000000
+--- a/packages/webhook/webhook-weixin/tests/sessionRouteStore.spec.ts
++++ /dev/null
+@@ -1,31 +0,0 @@
+-/** 路由存储测试：验证游标、SessionId 和 delivery 去重可跨实例恢复。 */
+-
+-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+-import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
+-import { describe, expect, it } from 'vitest'
+-import { SessionRouteStore } from '../src/session/sessionRouteStore.ts'
+-
+-describe('SessionRouteStore', () => {
+-  it('persists session mapping, cursor and delivery ids', async () => {
+-    const directory = await mkdtemp(join(tmpdir(), 'dsh-weixin-'))
+-    const file = join(directory, 'routes.json')
+-    try {
+-      const first = new SessionRouteStore(file)
+-      await first.load_state()
+-      await first.set_session_id('user-a', 'session-a')
+-      await first.set_cursor('cursor-a')
+-      expect(await first.accept_delivery('delivery-a')).toBe(true)
+-      expect(await first.accept_delivery('delivery-a')).toBe(false)
+-
+-      const second = new SessionRouteStore(file)
+-      await second.load_state()
+-      expect(second.get_session_id('user-a')).toBe('session-a')
+-      expect(second.get_cursor()).toBe('cursor-a')
+-      expect(await second.accept_delivery('delivery-a')).toBe(false)
+-      expect(JSON.parse(await readFile(file, 'utf8')).sessions['user-a']).toBe('session-a')
+-    } finally {
+-      await rm(directory, { recursive: true, force: true })
+-    }
+-  })
+-})
+diff --git a/packages/webhook/webhook-weixin/tsconfig.json b/packages/webhook/webhook-weixin/tsconfig.json
+index 6709b31..1c998d0 100644
+--- a/packages/webhook/webhook-weixin/tsconfig.json
++++ b/packages/webhook/webhook-weixin/tsconfig.json
+@@ -8,6 +8,7 @@
+     { "path": "../../attachment/attachment" },
+     { "path": "../../util/brand" },
+     { "path": "../../llm/llm" },
+-    { "path": "../../core/session" }
++    { "path": "../../core/session" },
++    { "path": "../../core/tools" }
+   ]
+ }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index d24cd81..6428d5a 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -305,6 +305,9 @@ importers:
+       '@deepseek-ai/dsh-tool-bash-persistent':
+         specifier: workspace:^
+         version: link:../../packages/shell/tool-bash-persistent
++      '@deepseek-ai/dsh-tool-codex':
++        specifier: workspace:^
++        version: link:../../packages/webhook/tool-codex
+       '@deepseek-ai/dsh-tool-cordis':
+         specifier: workspace:^
+         version: link:../../packages/extensions/tool-cordis
+@@ -320,6 +323,9 @@ importers:
+       '@deepseek-ai/dsh-tool-jobs':
+         specifier: workspace:^
+         version: link:../../packages/jobs/tool-jobs
++      '@deepseek-ai/dsh-tool-opencode':
++        specifier: workspace:^
++        version: link:../../packages/webhook/tool-opencode
+       '@deepseek-ai/dsh-tool-present':
+         specifier: workspace:^
+         version: link:../../packages/fs/tool-present
+@@ -362,6 +368,9 @@ importers:
+       '@deepseek-ai/dsh-webhook-github':
+         specifier: workspace:^
+         version: link:../../packages/webhook/webhook-github
++      '@deepseek-ai/dsh-webhook-weixin':
++        specifier: workspace:^
++        version: link:../../packages/webhook/webhook-weixin
+       '@deepseek-ai/dsh-workflow-ptc':
+         specifier: workspace:^
+         version: link:../../packages/workflow/workflow-ptc
+@@ -7793,7 +7802,7 @@ importers:
+         version: link:../../../vendor/schemastery
+       '@earendil-works/pi-ai':
+         specifier: ^0.85.1
+-        version: 0.85.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(supports-color@9.4.0)(ws@8.21.0)(zod@4.4.3)
++        version: 0.85.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)
+     devDependencies:
+       '@deepseek-ai/cordis':
+         specifier: workspace:^
+@@ -11605,6 +11614,24 @@ importers:
+         specifier: workspace:^
+         version: link:../web
+ 
++  packages/webhook/tool-codex:
++    devDependencies:
++      '@deepseek-ai/cordis':
++        specifier: workspace:^
++        version: link:../../../vendor/cordis
++      '@deepseek-ai/dsh-tools':
++        specifier: workspace:^
++        version: link:../../core/tools
++
++  packages/webhook/tool-opencode:
++    devDependencies:
++      '@deepseek-ai/cordis':
++        specifier: workspace:^
++        version: link:../../../vendor/cordis
++      '@deepseek-ai/dsh-tools':
++        specifier: workspace:^
++        version: link:../../core/tools
++
+   packages/webhook/webhook:
+     dependencies:
+       '@deepseek-ai/dsh-brand':
+@@ -16114,10 +16141,6 @@ packages:
+     resolution: {integrity: sha512-nTjqfcBFEipKdXCv4YDQWCfmcLZKm81ldF0pAopTvyrFGVbcR6P/VAAd5G7N+0tTr8QqiU0tFadD6FK4NtJwOA==}
+     engines: {node: '>= 0.6'}
+ 
+-  content-type@2.0.0:
+-    resolution: {integrity: sha512-j/O/d7GcZCyNl7/hwZAb606rzqkyvaDctLmckbxLzHvFBzTJHuGEdodATcP3yIRoDrLHkIATJuvzbFlp/ki2cQ==}
+-    engines: {node: '>=18'}
+-
+   content-type@2.1.0:
+     resolution: {integrity: sha512-mj7UPXE0jaqaOsukNZRUEfEi2AcL7C/vwmwcHV0O97eO1E1pxBZuyjlZrx5seTaNBg1U6+o35wpa35Qfcc+7ag==}
+     engines: {node: '>=18'}
+@@ -20158,14 +20181,14 @@ snapshots:
+     transitivePeerDependencies:
+       - '@algolia/client-search'
+ 
+-  '@earendil-works/pi-ai@0.85.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(supports-color@9.4.0)(ws@8.21.0)(zod@4.4.3)':
++  '@earendil-works/pi-ai@0.85.1(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.21.0)(zod@4.4.3)':
+     dependencies:
+       '@anthropic-ai/sdk': 0.123.0(zod@4.4.3)
+       '@aws-sdk/client-bedrock-runtime': 3.1048.0
+       '@earendil-works/pi-telemetry': 0.85.1
+       '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))
+       '@smithy/node-http-handler': 4.7.3
+-      http-proxy-agent: 7.0.2(supports-color@9.4.0)
++      http-proxy-agent: 7.0.2
+       https-proxy-agent: 7.0.6
+       openai: 6.40.0(ws@8.21.0)(zod@4.4.3)
+       partial-json: 0.1.7
+@@ -22715,7 +22738,7 @@ snapshots:
+   body-parser@2.3.0:
+     dependencies:
+       bytes: 3.1.2
+-      content-type: 2.0.0
++      content-type: 2.1.0
+       debug: 4.4.3(supports-color@9.4.0)
+       http-errors: 2.0.1
+       iconv-lite: 0.7.3
+@@ -22787,7 +22810,7 @@ snapshots:
+       cross-spawn: 7.0.6
+       debug: 4.4.3(supports-color@9.4.0)
+       fs-extra: 10.1.0
+-      http-proxy-agent: 7.0.2(supports-color@9.4.0)
++      http-proxy-agent: 7.0.2
+       https-proxy-agent: 7.0.6
+       js-yaml: 4.3.1
+       sanitize-filename: 1.6.4
+@@ -22940,8 +22963,6 @@ snapshots:
+ 
+   content-type@1.0.5: {}
+ 
+-  content-type@2.0.0: {}
+-
+   content-type@2.1.0: {}
+ 
+   convert-source-map@2.0.0: {}
+@@ -24102,7 +24123,7 @@ snapshots:
+       statuses: 2.0.2
+       toidentifier: 1.0.1
+ 
+-  http-proxy-agent@7.0.2(supports-color@9.4.0):
++  http-proxy-agent@7.0.2:
+     dependencies:
+       agent-base: 7.1.4
+       debug: 4.4.3(supports-color@9.4.0)
+@@ -26230,7 +26251,7 @@ snapshots:
+ 
+   type-is@2.1.0:
+     dependencies:
+-      content-type: 2.0.0
++      content-type: 2.1.0
+       media-typer: 1.1.1
+       mime-types: 3.0.2
+ 
+diff --git a/tsconfig.host.json b/tsconfig.host.json
+index 966de05..95f00ee 100644
+--- a/tsconfig.host.json
++++ b/tsconfig.host.json
+@@ -356,6 +356,8 @@
+     { "path": "./packages/webhook/webhook" },
+     { "path": "./packages/webhook/webhook-weixin" },
+     { "path": "./packages/webhook/webhook-github" },
++    { "path": "./packages/webhook/tool-opencode" },
++    { "path": "./packages/webhook/tool-codex" },
+     { "path": "./packages/todo/tool-todo" },
+     { "path": "./packages/plan/plan-mode" },
+     { "path": "./packages/preset/agent-presets" },
